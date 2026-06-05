@@ -1,0 +1,146 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.log
+
+# Virtual environments
+venv/
+ENV/
+env/
+py_venv/
+.venv
+virtualenv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Python testing and coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Node version managers
+.nvm
+.nvmrc
+
+# Node build outputs
+dist/
+build/
+.next/
+out/
+
+# MCP (Model Context Protocol)
+.mcp/
+mcp-server/
+mcp-client/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.vim/
+.emacs.d/
+
+# VS Code specific
+.vscode-test
+*.code-workspace
+
+# OS specific
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+*.lnk
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# System
+.cache/
+.tmp/
+tmp/
+temp/
+
+# IDEs
+.vscode
+.idea
+*.iml
+*.iws
+*.ipr
+
+# Python specific directories
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# MonoRepo specific
+/packages/*/node_modules
+/packages/*/dist
+/packages/*/.next
+/packages/*/.venv
+/packages/*/venv
