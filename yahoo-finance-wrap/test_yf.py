@@ -12,6 +12,11 @@ from yf import (
     download_price_history,
     extract_close_values,
     build_portfolio_distribution,
+    get_ticker_percent_changes,
+    build_watchlist_fundamentals,
+    build_peer_pe_chart,
+    build_market_cap_chart,
+    get_ticker_info,
 )
 
 
@@ -226,6 +231,23 @@ class TestPortfolioHelpers:
 
         assert result == {"NVDA": 101.0, "MSFT": 202.0}
 
+    def test_get_ticker_percent_changes_with_multiindex(self):
+        arrays = [
+            ["NVDA", "NVDA", "MSFT", "MSFT"],
+            ["Close", "Open", "Close", "Open"],
+        ]
+        columns = pd.MultiIndex.from_arrays(arrays)
+        history = pd.DataFrame(
+            [[100.0, 99.0, 200.0, 198.0], [101.0, 100.0, 202.0, 200.0]],
+            index=pd.date_range("2023-01-01", periods=2),
+            columns=columns,
+        )
+
+        result = get_ticker_percent_changes(history, ["NVDA", "MSFT"])
+
+        assert result["NVDA"] == pytest.approx((101.0 - 100.0) / 100.0)
+        assert result["MSFT"] == pytest.approx((202.0 - 200.0) / 200.0)
+
     def test_build_portfolio_distribution_allocates_weights(self):
         close_values = {"NVDA": 100.0, "MSFT": 200.0, "AAPL": 0.0}
         distribution = build_portfolio_distribution(close_values)
@@ -233,6 +255,69 @@ class TestPortfolioHelpers:
         assert list(distribution["ticker"]) == ["MSFT", "NVDA"]
         assert distribution.loc[distribution["ticker"] == "NVDA", "weight"].iloc[0] == pytest.approx(100.0 / 300.0)
         assert distribution.loc[distribution["ticker"] == "MSFT", "value"].iloc[0] == 200.0
+
+
+class TestFundamentalHelpers:
+    """Tests for new fundamental analysis helpers."""
+
+    @patch("yf.yf.Ticker")
+    def test_get_ticker_info_returns_info(self, mock_ticker_class):
+        mock_ticker = Mock()
+        mock_ticker.info = {"symbol": "AAPL", "longName": "Apple Inc."}
+        mock_ticker_class.return_value = mock_ticker
+
+        result = get_ticker_info("AAPL")
+
+        assert result == {"symbol": "AAPL", "longName": "Apple Inc."}
+        mock_ticker_class.assert_called_once_with("AAPL")
+
+    @patch("yf.yf.Ticker")
+    def test_build_watchlist_fundamentals_builds_dataframe(self, mock_ticker_class):
+        get_ticker_info.cache_clear()
+        mapping = {
+            "AAPL": {"longName": "Apple Inc.", "trailingPE": 28.4, "marketCap": 2500000000000},
+            "MSFT": {"longName": "Microsoft Corp.", "trailingPE": 35.7, "marketCap": 2200000000000},
+        }
+
+        def side_effect(symbol):
+            mock_obj = Mock()
+            mock_obj.info = mapping[symbol]
+            return mock_obj
+
+        mock_ticker_class.side_effect = side_effect
+        df = build_watchlist_fundamentals(["AAPL", "MSFT"])
+
+        assert list(df["ticker"]) == ["AAPL", "MSFT"]
+        assert df.loc[df["ticker"] == "AAPL", "trailingPE"].iloc[0] == 28.4
+        assert df.loc[df["ticker"] == "MSFT", "marketCap"].iloc[0] == 2200000000000.0
+
+    def test_build_peer_pe_chart_returns_bar_chart(self):
+        peer_df = pd.DataFrame(
+            [
+                {"ticker": "AAPL", "trailingPE": 28.4},
+                {"ticker": "MSFT", "trailingPE": 35.7},
+            ]
+        )
+
+        chart = build_peer_pe_chart(peer_df, "AAPL")
+        spec = chart.to_dict()
+
+        assert spec["mark"]["type"] == "bar"
+        assert spec["encoding"]["x"]["field"] == "trailingPE"
+
+    def test_build_market_cap_chart_returns_bar_chart(self):
+        peer_df = pd.DataFrame(
+            [
+                {"ticker": "AAPL", "marketCap": 2500000000000.0},
+                {"ticker": "MSFT", "marketCap": 2200000000000.0},
+            ]
+        )
+
+        chart = build_market_cap_chart(peer_df, "AAPL")
+        spec = chart.to_dict()
+
+        assert spec["mark"]["type"] == "bar"
+        assert spec["encoding"]["x"]["field"] == "marketCap"
 
 
 if __name__ == "__main__":
