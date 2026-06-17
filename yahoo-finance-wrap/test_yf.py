@@ -1,0 +1,239 @@
+import json
+import os
+import tempfile
+import pytest
+from unittest.mock import Mock, patch, MagicMock
+import pandas as pd
+
+from yf import (
+    create_sample_config,
+    load_tickers,
+    build_summary,
+    download_price_history,
+    extract_close_values,
+    build_portfolio_distribution,
+)
+
+
+class TestCreateSampleConfig:
+    """Tests for create_sample_config function."""
+
+    def test_creates_config_file(self):
+        """Test that config file is created with correct content."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "test_config.json")
+            result = create_sample_config(config_path)
+
+            assert os.path.exists(config_path)
+            assert result == ["MSFT", "AAPL", "GOOG"]
+
+    def test_config_content_is_valid_json(self):
+        """Test that created config file contains valid JSON."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "test_config.json")
+            create_sample_config(config_path)
+
+            with open(config_path, "r") as f:
+                config = json.load(f)
+
+            assert "tickers" in config
+            assert isinstance(config["tickers"], list)
+
+    def test_returns_correct_tickers(self):
+        """Test that function returns the tickers list."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "test_config.json")
+            tickers = create_sample_config(config_path)
+
+            assert len(tickers) == 3
+            assert "MSFT" in tickers
+
+
+class TestLoadTickers:
+    """Tests for load_tickers function."""
+
+    def test_loads_existing_config(self):
+        """Test loading tickers from existing config file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "config.json")
+            config = {"tickers": ["NVDA", "TSLA", "AMD"]}
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            result = load_tickers(config_path)
+            assert result == ["NVDA", "TSLA", "AMD"]
+
+    def test_creates_config_if_not_exists(self):
+        """Test that config is created if it doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "new_config.json")
+
+            result = load_tickers(config_path)
+
+            assert os.path.exists(config_path)
+            assert isinstance(result, list)
+
+    def test_handles_invalid_json(self):
+        """Test that invalid JSON creates new config."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "bad_config.json")
+            with open(config_path, "w") as f:
+                f.write("invalid json {")
+
+            result = load_tickers(config_path)
+
+            assert isinstance(result, list)
+            assert len(result) == 3
+
+    def test_handles_missing_tickers_key(self):
+        """Test that missing tickers key creates new config."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "bad_config.json")
+            config = {"stocks": ["AAPL"]}
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            result = load_tickers(config_path)
+
+            assert isinstance(result, list)
+
+    def test_handles_empty_tickers_list(self):
+        """Test that empty tickers list creates new config."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "empty_config.json")
+            config = {"tickers": []}
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            result = load_tickers(config_path)
+
+            assert isinstance(result, list)
+            assert len(result) > 0
+
+
+class TestBuildSummary:
+    """Tests for build_summary function."""
+
+    def test_builds_summary_with_all_fields(self):
+        """Test building summary with all fields present."""
+        info = {
+            "symbol": "NVDA",
+            "longName": "NVIDIA Corporation",
+            "regularMarketPrice": 450.25,
+            "previousClose": 448.50,
+            "open": 449.75,
+            "fiftyTwoWeekHigh": 525.00,
+            "fiftyTwoWeekLow": 320.00,
+            "marketCap": 1500000000000,
+            "trailingPE": 45.5,
+        }
+
+        result = build_summary(info)
+
+        assert result["Symbol"] == "NVDA"
+        assert result["Name"] == "NVIDIA Corporation"
+        assert result["Current Price"] == 450.25
+        assert result["Market Cap"] == 1500000000000
+
+    def test_builds_summary_with_missing_fields(self):
+        """Test building summary when some fields are missing."""
+        info = {
+            "symbol": "TEST",
+            "longName": "Test Corp",
+        }
+
+        result = build_summary(info)
+
+        assert result["Symbol"] == "TEST"
+        assert result["Name"] == "Test Corp"
+        assert result["Current Price"] is None
+        assert result["PE Ratio"] is None
+
+    def test_returns_dict_with_expected_keys(self):
+        """Test that summary contains all expected keys."""
+        info = {"symbol": "TEST"}
+
+        result = build_summary(info)
+
+        expected_keys = [
+            "Symbol",
+            "Name",
+            "Current Price",
+            "Previous Close",
+            "Open",
+            "52 Week High",
+            "52 Week Low",
+            "Market Cap",
+            "PE Ratio",
+        ]
+
+        for key in expected_keys:
+            assert key in result
+
+
+class TestDownloadPriceHistory:
+    """Tests for download_price_history function."""
+
+    @patch("yf.yf.download")
+    def test_downloads_history_single_ticker(self, mock_download):
+        """Test downloading history for a single ticker."""
+        mock_data = pd.DataFrame({
+            "Close": [100.0, 101.0, 102.0],
+            "Open": [99.0, 100.5, 101.5],
+            "Volume": [1000000, 1100000, 1200000],
+        }, index=pd.date_range("2023-01-01", periods=3))
+
+        mock_download.return_value = mock_data
+
+        result = download_price_history(["NVDA"])
+
+        assert mock_download.called
+        mock_download.assert_called_once()
+
+    @patch("yf.yf.download")
+    def test_downloads_history_multiple_tickers(self, mock_download):
+        """Test downloading history for multiple tickers."""
+        mock_data = pd.DataFrame({
+            "Close": [100.0, 101.0],
+        }, index=pd.date_range("2023-01-01", periods=2))
+
+        mock_download.return_value = mock_data
+
+        result = download_price_history(["NVDA", "MSFT", "AAPL"])
+
+        assert mock_download.called
+        call_args = mock_download.call_args
+        assert call_args[1]["period"] == "1mo"
+        assert call_args[1]["auto_adjust"] is True
+
+
+class TestPortfolioHelpers:
+    """Tests for portfolio distribution helpers."""
+
+    def test_extract_close_values_from_multiindex(self):
+        arrays = [
+            ["NVDA", "NVDA", "MSFT", "MSFT"],
+            ["Close", "Open", "Close", "Open"],
+        ]
+        columns = pd.MultiIndex.from_arrays(arrays)
+        history = pd.DataFrame(
+            [[100.0, 99.0, 200.0, 198.0], [101.0, 100.0, 202.0, 200.0]],
+            index=pd.date_range("2023-01-01", periods=2),
+            columns=columns,
+        )
+
+        result = extract_close_values(history, ["NVDA", "MSFT"])
+
+        assert result == {"NVDA": 101.0, "MSFT": 202.0}
+
+    def test_build_portfolio_distribution_allocates_weights(self):
+        close_values = {"NVDA": 100.0, "MSFT": 200.0, "AAPL": 0.0}
+        distribution = build_portfolio_distribution(close_values)
+
+        assert list(distribution["ticker"]) == ["MSFT", "NVDA"]
+        assert distribution.loc[distribution["ticker"] == "NVDA", "weight"].iloc[0] == pytest.approx(100.0 / 300.0)
+        assert distribution.loc[distribution["ticker"] == "MSFT", "value"].iloc[0] == 200.0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
