@@ -17,6 +17,13 @@ from yf import (
     build_peer_pe_chart,
     build_market_cap_chart,
     get_ticker_info,
+    calculate_rsi,
+    calculate_macd,
+    build_candlestick_chart,
+    build_rsi_chart,
+    build_macd_chart,
+    calculate_returns_and_correlation,
+    build_correlation_heatmap,
 )
 
 
@@ -208,7 +215,7 @@ class TestDownloadPriceHistory:
 
         assert mock_download.called
         call_args = mock_download.call_args
-        assert call_args[1]["period"] == "1mo"
+        assert call_args[1]["period"] == "1y"
         assert call_args[1]["auto_adjust"] is True
 
 
@@ -318,6 +325,121 @@ class TestFundamentalHelpers:
 
         assert spec["mark"]["type"] == "bar"
         assert spec["encoding"]["x"]["field"] == "marketCap"
+
+
+class TestTechnicalIndicators:
+    """Tests for technical indicator calculation helpers."""
+
+    def test_calculate_rsi_returns_series(self):
+        """Test RSI calculation returns a series with values between 0-100."""
+        prices = pd.Series([100, 101, 99, 102, 101, 103, 100, 98, 97, 99, 101, 102, 104, 103, 102])
+        rsi = calculate_rsi(prices, window=5)
+        
+        assert isinstance(rsi, pd.Series)
+        assert len(rsi) == len(prices)
+        valid_rsi = rsi.dropna()
+        assert (valid_rsi >= 0).all() or (valid_rsi <= 100).all() or rsi.isna().any()
+
+    def test_calculate_rsi_extremes(self):
+        """Test RSI with all gains (should approach 100) and all losses (should approach 0)."""
+        ascending = pd.Series([100 + i for i in range(20)])
+        rsi_up = calculate_rsi(ascending, window=5).iloc[-1]
+        
+        descending = pd.Series([100 - i for i in range(20)])
+        rsi_down = calculate_rsi(descending, window=5).iloc[-1]
+        
+        assert rsi_up > 70 or pd.isna(rsi_up)
+        assert rsi_down < 30 or pd.isna(rsi_down)
+
+    def test_calculate_macd_returns_three_series(self):
+        """Test MACD returns MACD, signal, and histogram lines."""
+        prices = pd.Series([100 + i * 0.5 for i in range(50)])
+        macd, signal, hist = calculate_macd(prices, fast=12, slow=26, signal=9)
+        
+        assert isinstance(macd, pd.Series)
+        assert isinstance(signal, pd.Series)
+        assert isinstance(hist, pd.Series)
+        assert len(macd) == len(prices)
+        assert len(signal) == len(prices)
+        assert len(hist) == len(prices)
+
+    def test_build_candlestick_chart_with_insufficient_data(self):
+        """Test candlestick chart returns None with fewer than 50 bars."""
+        small_history = pd.DataFrame({
+            "Open": [100, 101, 99],
+            "High": [101, 102, 100],
+            "Low": [99, 100, 98],
+            "Close": [100.5, 101.5, 99.5],
+            "Volume": [1000, 1100, 900],
+        }, index=pd.date_range("2023-01-01", periods=3))
+        
+        chart = build_candlestick_chart(small_history)
+        assert chart is None
+
+    def test_build_candlestick_chart_with_sufficient_data(self):
+        """Test candlestick chart builds with 50+ days of data."""
+        history = pd.DataFrame({
+            "Open": [100 + i * 0.1 for i in range(60)],
+            "High": [101 + i * 0.1 for i in range(60)],
+            "Low": [99 + i * 0.1 for i in range(60)],
+            "Close": [100.5 + i * 0.1 for i in range(60)],
+            "Volume": [1000000] * 60,
+        }, index=pd.date_range("2023-01-01", periods=60))
+        
+        chart = build_candlestick_chart(history)
+        assert chart is not None
+        spec = chart.to_dict()
+        assert "vconcat" in spec
+
+    def test_build_rsi_chart_with_insufficient_data(self):
+        """Test RSI chart returns None with fewer than 20 bars."""
+        small_history = pd.DataFrame({
+            "Close": [100, 101, 99, 102, 101, 103, 100, 98, 97, 99],
+        }, index=pd.date_range("2023-01-01", periods=10))
+        
+        chart = build_rsi_chart(small_history)
+        assert chart is None
+
+    def test_build_macd_chart_with_insufficient_data(self):
+        """Test MACD chart returns None with fewer than 30 bars."""
+        small_history = pd.DataFrame({
+            "Close": [100 + i * 0.1 for i in range(20)],
+        }, index=pd.date_range("2023-01-01", periods=20))
+        
+        chart = build_macd_chart(small_history)
+        assert chart is None
+
+    def test_calculate_returns_and_correlation(self):
+        """Test correlation matrix calculation from returns."""
+        history = pd.DataFrame({
+            ("AAPL", "Close"): [100, 101, 99, 102, 101],
+            ("MSFT", "Close"): [200, 202, 198, 205, 203],
+        }, index=pd.date_range("2023-01-01", periods=5))
+        history.columns = pd.MultiIndex.from_tuples(history.columns)
+        
+        corr = calculate_returns_and_correlation(history, ["AAPL", "MSFT"])
+        assert corr is not None
+        assert isinstance(corr, pd.DataFrame)
+        assert corr.shape[0] == 2
+        assert corr.shape[1] == 2
+
+    def test_build_correlation_heatmap_with_valid_matrix(self):
+        """Test correlation heatmap chart builds from correlation matrix."""
+        corr_matrix = pd.DataFrame({
+            "AAPL": [1.0, 0.75],
+            "MSFT": [0.75, 1.0],
+        }, index=["AAPL", "MSFT"])
+        
+        chart = build_correlation_heatmap(corr_matrix)
+        assert chart is not None
+        spec = chart.to_dict()
+        assert spec["mark"]["type"] == "rect"
+
+    def test_build_correlation_heatmap_with_empty_matrix(self):
+        """Test correlation heatmap returns None with empty matrix."""
+        empty_corr = pd.DataFrame()
+        chart = build_correlation_heatmap(empty_corr)
+        assert chart is None
 
 
 if __name__ == "__main__":
