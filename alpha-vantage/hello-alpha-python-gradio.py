@@ -34,7 +34,7 @@ def load_mcp_config_from_vscode(server_name: str = "alphavantage") -> str:
         _debug_log(f"Using cached MCP URL: {_cached_mcp_url}")
         return _cached_mcp_url
     
-    config_path = os.path.join(".vscode", "mcp.json")
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vscode", "mcp.json")
     _debug_log(f"Config path resolved to: {config_path}")
     
     if not os.path.exists(config_path):
@@ -94,6 +94,21 @@ def extract_ticker(message: str) -> str | None:
     _debug_log("No valid ticker found in message")
     return None
 
+def _extract_text_from_content(content) -> str | None:
+    """Safely extract text from an MCP tool response content list.
+
+    Scans content items for the first one exposing a ``.text`` attribute and
+    returns it. Returns None if no text-bearing item is present, guarding
+    against non-text content types (images, embedded resources, etc.).
+    """
+    if not content:
+        return None
+    for item in content:
+        text = getattr(item, "text", None)
+        if text is not None:
+            return text
+    return None
+
 async def call_alpha_vantage_mcp(ticker: str) -> str:
     """
     Executes transaction tasks inside a transient stream context.
@@ -127,10 +142,18 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
                 _debug_log(f"Tool response received, content length: {len(response.content) if response.content else 0}")
                 _debug_log(f"Full response metadata: isError={getattr(response, 'isError', 'N/A')}")
                 
+                if getattr(response, "isError", False):
+                    error_text = _extract_text_from_content(response.content)
+                    _debug_log(f"Server reported tool error: {error_text}")
+                    return f"### Tool Error\nThe server reported an error executing the tool.\n{error_text}"
+                
                 if response.content and len(response.content) > 0:
-                    result_text = response.content[0].text
-                    _debug_log(f"Response content text length: {len(result_text)}")
-                    return result_text
+                    result_text = _extract_text_from_content(response.content)
+                    if result_text is not None:
+                        _debug_log(f"Response content text length: {len(result_text)}")
+                        return result_text
+                    _debug_log("No text-bearing content items found in response")
+                    return "Server executed successfully but returned no text content."
                 
                 _debug_log("Empty response content received")
                 return "Server executed successfully but returned an empty context payload data block."

@@ -12,6 +12,23 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
+# Inject lightweight stubs for gradio and mcp BEFORE importing the main module.
+# The real `import gradio` can hang during collection in some environments, and
+# the `mcp` package may not be installed in the interpreter running pytest. The
+# tests mock streamablehttp_client / ClientSession anyway, so stubs suffice.
+if "gradio" not in sys.modules:
+    gradio_stub = MagicMock()
+    gradio_stub.ChatInterface = MagicMock()
+    sys.modules["gradio"] = gradio_stub
+
+if "mcp" not in sys.modules:
+    sys.modules["mcp"] = MagicMock()
+if "mcp.client" not in sys.modules:
+    sys.modules["mcp.client"] = MagicMock()
+if "mcp.client.streamable_http" not in sys.modules:
+    streamable_stub = MagicMock()
+    sys.modules["mcp.client.streamable_http"] = streamable_stub
+
 # Import functions to test from the script file directly
 script_path = Path(__file__).resolve().parent / "hello-alpha-python-gradio.py"
 spec = importlib.util.spec_from_file_location("hello_alpha_python_gradio", script_path)
@@ -166,6 +183,7 @@ class TestCallAlphaVantageMcp:
 
         # Mock the MCP response
         mock_response = MagicMock()
+        mock_response.isError = False
         mock_response.content = [MagicMock(text="AAPL: $150.00")]
 
         with patch("hello_alpha_python_gradio.load_mcp_config_from_vscode", return_value="http://localhost:3000"):
@@ -194,6 +212,7 @@ class TestCallAlphaVantageMcp:
     async def test_call_alpha_vantage_mcp_empty_response(self):
         """Test MCP call handles empty response from server."""
         mock_response = MagicMock()
+        mock_response.isError = False
         mock_response.content = []
 
         with patch("hello_alpha_python_gradio.load_mcp_config_from_vscode", return_value="http://localhost:3000"):
@@ -209,6 +228,37 @@ class TestCallAlphaVantageMcp:
 
                     result = await call_alpha_vantage_mcp("AAPL")
                     assert "empty context payload" in result.lower()
+
+    async def _run_with_mocks(self, mock_response):
+        with patch("hello_alpha_python_gradio.load_mcp_config_from_vscode", return_value="http://localhost:3000"):
+            with patch("hello_alpha_python_gradio.streamablehttp_client") as mock_client:
+                mock_session = AsyncMock()
+                mock_session.call_tool = AsyncMock(return_value=mock_response)
+                mock_session.initialize = AsyncMock()
+                mock_client.return_value.__aenter__.return_value = (AsyncMock(), AsyncMock(), AsyncMock())
+                with patch("hello_alpha_python_gradio.ClientSession") as mock_cs:
+                    mock_cs.return_value.__aenter__.return_value = mock_session
+                    return await call_alpha_vantage_mcp("AAPL")
+
+    async def test_call_alpha_vantage_mcp_server_error(self):
+        """Test MCP call surfaces server-reported tool errors (isError=True)."""
+        mock_response = MagicMock()
+        mock_response.isError = True
+        mock_response.content = [MagicMock(text="Invalid ticker")]
+
+        result = await self._run_with_mocks(mock_response)
+        assert "Tool Error" in result
+        assert "Invalid ticker" in result
+
+    async def test_call_alpha_vantage_mcp_non_text_content(self):
+        """Test MCP call handles non-text content items without crashing."""
+        mock_response = MagicMock()
+        mock_response.isError = False
+        # Items without a .text attribute (e.g. ImageContent)
+        mock_response.content = [MagicMock(spec=[]), MagicMock(spec=[])]
+
+        result = await self._run_with_mocks(mock_response)
+        assert "no text content" in result.lower()
 
 
 @pytest.mark.asyncio
