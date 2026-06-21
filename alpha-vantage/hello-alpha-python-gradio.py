@@ -109,6 +109,32 @@ def _extract_text_from_content(content) -> str | None:
             return text
     return None
 
+
+def _unwrap_exceptions(exc: BaseException) -> list[str]:
+    """Recursively flatten an exception (and any nested ExceptionGroups).
+
+    The MCP streamable-HTTP transport raises ``ExceptionGroup`` (a.k.a.
+    ``BaseExceptionGroup``) instances that can wrap the real error multiple
+    layers deep. Without recursive unwrapping the user only sees the useless
+    "unhandled errors in a TaskGroup" message instead of the actionable root
+    cause (e.g. ``McpError: Session terminated``). Returns a list of
+    ``Type: message`` strings, one per leaf exception found.
+    """
+    leaves: list[str] = []
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        sub_excs = getattr(current, "exceptions", None)
+        if sub_excs:
+            queue.extend(sub_excs)
+        else:
+            leaves.append(f"{type(current).__name__}: {current}")
+    return leaves
+
 async def call_alpha_vantage_mcp(ticker: str) -> str:
     """
     Executes transaction tasks inside a transient stream context.
@@ -133,11 +159,21 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
                 _debug_log("ClientSession created, initializing...")
                 await session.initialize()
                 _debug_log("Session initialized successfully")
-                
-                _debug_log(f"Calling tool 'get_stock_quote' with arguments: {{'ticker': '{ticker}'}}")
+
+                # The Alpha Vantage MCP server exposes a meta-tool interface
+                # (TOOL_LIST / TOOL_GET / TOOL_CALL) rather than individual
+                # endpoints. To fetch a quote we invoke TOOL_CALL which wraps
+                # the underlying GLOBAL_QUOTE Alpha Vantage function. The inner
+                # arguments MUST be a JSON-encoded string (per the TOOL_CALL
+                # schema) and GLOBAL_QUOTE expects a "symbol" parameter.
+                tool_call_args = {
+                    "tool_name": "GLOBAL_QUOTE",
+                    "arguments": json.dumps({"symbol": ticker}),
+                }
+                _debug_log(f"Calling tool 'TOOL_CALL' with arguments: {tool_call_args}")
                 response = await session.call_tool(
-                    name="get_stock_quote",
-                    arguments={"ticker": ticker}
+                    name="TOOL_CALL",
+                    arguments=tool_call_args,
                 )
                 _debug_log(f"Tool response received, content length: {len(response.content) if response.content else 0}")
                 _debug_log(f"Full response metadata: isError={getattr(response, 'isError', 'N/A')}")
@@ -161,14 +197,23 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
     except Exception as protocol_err:
         _debug_log(f"Protocol error: {type(protocol_err).__name__}: {protocol_err}")
         _debug_log(f"Full traceback:\n{traceback.format_exc()}")
-        
-        # Extract sub-exceptions from ExceptionGroup for better error reporting
-        error_details = str(protocol_err)
-        if hasattr(protocol_err, "exceptions"):
-            for sub_exc in protocol_err.exceptions:
-                _debug_log(f"  Sub-exception: {type(sub_exc).__name__}: {sub_exc}")
-                error_details += f"\n  Sub: {type(sub_exc).__name__}: {sub_exc}"
-        return f"### Protocol Transport Fault\nUnable to fulfill network transaction. Details: `{error_details}`"
+
+        # Recursively unwrap ExceptionGroup/BaseExceptionGroup instances so the
+        # actionable root cause (e.g. McpError: Session terminated) is reported
+        # instead of the opaque "unhandled errors in a TaskGroup" wrapper.
+        leaf_errors = _unwrap_exceptions(protocol_err)
+        _debug_log(f"Unwrapped leaf exceptions: {leaf_errors}")
+
+        if leaf_errors:
+            error_details = "\n".join(f"  - {leaf}" for leaf in leaf_errors)
+        else:
+            error_details = f"{type(protocol_err).__name__}: {protocol_err}"
+
+        return (
+            "### Protocol Transport Fault\n"
+            "Unable to fulfill network transaction. Root cause(s):\n"
+            f"{error_details}"
+        )
 
 async def chat_with_mcp(message: str, history: list) -> str:
     """

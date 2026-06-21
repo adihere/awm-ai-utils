@@ -108,10 +108,10 @@ pip install -r requirements.txt
 ```
 
 Required packages:
-- `streamlit==1.58.0` - Web application framework
-- `yfinance==1.4.1` - Yahoo Finance API wrapper
-- `altair==6.1.0` - Declarative visualization library
-- `pandas==3.0.3` - Data manipulation and analysis
+- `streamlit>=1.30.0` - Web application framework
+- `yfinance>=1.4.0` - Yahoo Finance API wrapper
+- `altair>=5.0.0` - Declarative visualization library
+- `pandas>=2.0.0` - Data manipulation and analysis
 
 ### Alpha Vantage MCP Integration
 ```bash
