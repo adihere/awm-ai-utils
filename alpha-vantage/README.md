@@ -1,422 +1,351 @@
-# Alpha Vantage MCP Integration
+# Alpha Vantage MCP Integration — Technical Implementation
 
-A Gradio-based chat interface for querying stock quotes using the Model Context Protocol (MCP) to integrate with Alpha Vantage financial data services.
+Gradio-based chat interface that queries stock quotes through the Model Context Protocol (MCP) over a Streamable HTTP transport to an Alpha Vantage backend.
 
-## 🚀 Overview
-
-This module provides a conversational interface for stock market queries, leveraging the MCP protocol to communicate with Alpha Vantage backend services. It combines natural language processing with async/await patterns for responsive, real-time stock information retrieval.
-
-## 🎯 Key Features
-
-### Natural Language Interface
-- Chat-based interaction for intuitive stock queries
-- Automatic ticker symbol extraction from user messages
-- Support for various query formats: "What's TSLA price?" or "Check NVDA"
-
-### MCP Protocol Integration
-- Standardized Model Context Protocol for AI tool integration
-- HTTP transport layer with async support
-- Session management and initialization handling
-
-### Async Architecture
-- Non-blocking I/O operations for optimal performance
-- Graceful error handling with detailed debugging
-- Support for concurrent requests
-
-### Robust Error Handling
-- Configuration validation and error reporting
-- Protocol-level error detection and user-friendly messages
-- Debug mode for troubleshooting
-
-## 📁 Project Structure
+## Module Architecture
 
 ```
-alpha-vantage/
-├── hello-alpha-python-gradio.py  # Main Gradio application (184 lines)
-├── test_hello_alpha.py           # Comprehensive test suite (237 lines)
-├── requirements.txt              # Python dependencies
-├── .env                          # Environment configuration (optional)
-└── .vscode/
-    └── mcp.json                  # MCP server configuration
+User message
+    │
+    ▼
+chat_with_mcp(message, history)          ← async entry (Gradio hook)
+    │
+    ├─ extract_ticker(message)           ← sync regex extraction
+    │      │
+    │      ├─ re.sub(r'[^\w\s]', '', message).upper()
+    │      ├─ re.findall(r'\b[A-Z]{1,5}\b', cleaned)
+    │      └─ reversed scan with stop-word filter → ticker or None
+    │
+    ▼
+call_alpha_vantage_mcp(ticker)           ← async MCP transaction
+    │
+    ├─ load_mcp_config_from_vscode()     ← sync file I/O
+    │      ↓ .vscode/mcp.json → URL (cached globally)
+    │
+    ├─ streamablehttp_client(url)        ← async context manager
+    │      ↓ (read_stream, write_stream, _)
+    │
+    ├─ ClientSession(read, write)        ← async context manager
+    │      ↓ session.initialize()
+    │
+    └─ session.call_tool("TOOL_CALL", { ← meta-tool dispatch
+           "tool_name": "GLOBAL_QUOTE",
+           "arguments": json.dumps({"symbol": ticker})
+       })
+           ↓
+       MCP response → _extract_text_from_content() → string
 ```
 
-## 🛠️ Installation
+## MCP Session Lifecycle
 
-### Prerequisites
-- Python 3.11 or higher
-- MCP-compatible Alpha Vantage server running on accessible endpoint
+Each stock query creates a **transient session** — there is no connection pooling or persistent session reuse. The lifecycle:
 
-### Setup
+1. **Transport open** — `streamablehttp_client(url)` establishes the HTTP connection. Returns `(read_stream, write_stream, session_id_callback)`.
+2. **Session init** — `ClientSession(read_stream, write_stream)` wraps the streams. `await session.initialize()` performs the MCP protocol handshake (version negotiation, capability exchange). The server responds with a `mcp-session-id` header.
+3. **Tool call** — `session.call_tool(name, arguments)` sends a JSON-RPC request. The `isError` flag on the response distinguishes server-side tool errors from transport-level failures.
+4. **Context exit** — Both `async with` blocks close in reverse order, terminating the session and releasing the HTTP connection.
 
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
+This transient approach avoids stale-session errors on the stateless Alpha Vantage server.
+
+## Meta-Tool Invocation Pattern
+
+The Alpha Vantage MCP server does **not** expose individual tool endpoints like `get_stock_quote`. Instead, it provides three meta-tools:
+
+| Meta-Tool | Purpose | Parameters |
+|---|---|---|
+| `TOOL_LIST` | List available Alpha Vantage functions | None |
+| `TOOL_GET` | Retrieve schema for a specific function | `tool_name: str` |
+| `TOOL_CALL` | Execute an Alpha Vantage function | `tool_name: str`, `arguments: str` |
+
+The invocation for a stock quote:
+
+```python
+response = await session.call_tool(
+    name="TOOL_CALL",
+    arguments={
+        "tool_name": "GLOBAL_QUOTE",
+        "arguments": json.dumps({"symbol": ticker}),
+    },
+)
 ```
 
-Required packages:
-- `gradio` - Chat interface framework
-- `mcp` - Model Context Protocol client library
-- `python-dotenv` - Environment variable management
-- `pytest>=7.0.0` - Testing framework
-- `pytest-asyncio>=0.21.0` - Async testing support
+**Critical**: `TOOL_CALL`'s `arguments` field is typed as `string` in the server schema, not `object`. Passing a dict causes a protocol error. The inner parameters must be serialized with `json.dumps()`.
 
-2. Configure MCP server:
-Create `.vscode/mcp.json` with your Alpha Vantage server configuration:
+The original implementation called `session.call_tool(name="get_stock_quote", arguments={"ticker": ticker})`, which caused the server to return HTTP 404. The streamable-HTTP transport interprets 404 as a transport failure, wrapping the resulting `McpError: Session terminated` in two levels of `ExceptionGroup`.
+
+## Error Propagation Chain
+
+Errors are handled at three distinct layers, each producing a markdown-formatted response string:
+
+### Transport Errors (Python exceptions)
+
+```
+HTTP 404 / network failure
+    │
+    ▼ ExceptionGroup(ExceptionGroup(McpError("Session terminated")))
+    │
+    ▼ _unwrap_exceptions() → ["McpError: Session terminated"]
+    │
+    ▼ "### Protocol Transport Fault\nUnable to fulfill network transaction.\n  - McpError: Session terminated"
+```
+
+### Server Tool Errors (isError=True on response)
+
+```
+response.isError == True
+    │
+    ▼ _extract_text_from_content(response.content)
+    │
+    ▼ "### Tool Error\nThe server reported an error executing the tool.\n{error_text}"
+```
+
+### Application Errors (config, validation)
+
+```
+FileNotFoundError / KeyError / ValueError
+    │
+    ▼ "### Configuration Error\n{message}"
+```
+
+Or for un-extractable tickers:
+
+```
+extract_ticker() → None
+    │
+    ▼ "I couldn't isolate a clean ticker tracking label in your input..."
+```
+
+The Gradio interface **never** receives an unhandled exception — all paths return a formatted string.
+
+## Exception Unwrapping — `_unwrap_exceptions()`
+
+The MCP streamable-HTTP transport wraps errors in nested `ExceptionGroup` / `BaseExceptionGroup`. A single-level `.exceptions` iteration only reveals the next wrapper, not the leaf cause. The unwrapper uses **BFS traversal** with cycle detection:
+
+```python
+def _unwrap_exceptions(exc: BaseException) -> list[str]:
+    leaves = []
+    queue = [exc]
+    seen = set()
+    while queue:
+        current = queue.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        sub_excs = getattr(current, "exceptions", None)
+        if sub_excs:
+            queue.extend(sub_excs)
+        else:
+            leaves.append(f"{type(current).__name__}: {current}")
+    return leaves
+```
+
+Design choices:
+- **BFS over recursion**: Iterative, no `RecursionError` risk on deeply nested groups.
+- **`id()` cycle detection**: Prevents infinite loops if an exception graph contains circular references.
+- **`getattr(current, "exceptions", None)`**: Works for both `ExceptionGroup` and `BaseExceptionGroup` without type checking — only groups have the `.exceptions` attribute.
+
+## Response Content Extraction — `_extract_text_from_content()`
+
+The MCP response `content` field is a list of typed content items (text, image, embedded resource). The helper avoids `IndexError` and `AttributeError`:
+
+```python
+def _extract_text_from_content(content) -> str | None:
+    if not content:
+        return None
+    for item in content:
+        text = getattr(item, "text", None)
+        if text is not None:
+            return text
+    return None
+```
+
+Returns the first text-bearing item, or `None` if the response contains only non-text content (e.g. images).
+
+## Configuration System
+
+### MCP Config — `.vscode/mcp.json`
 
 ```json
 {
   "servers": {
     "alphavantage": {
       "type": "http",
-      "url": "http://localhost:3000"
+      "url": "https://mcp.alphavantage.co/mcp?apikey={API_KEY}"
     }
   }
 }
 ```
 
-3. Optional debug mode:
-Create `.env` file for enhanced logging:
-```
+Validation rules enforced by `load_mcp_config_from_vscode()`:
+
+| Check | Condition | Exception |
+|---|---|---|
+| File exists | `os.path.exists(config_path)` | `FileNotFoundError` |
+| Server name found | `config["servers"].get(server_name)` | `KeyError` |
+| Transport type | `server_info["type"] == "http"` | `ValueError` |
+| URL present | `server_info.get("url")` truthy | `ValueError` |
+
+The resolved URL is cached in the module-level `_cached_mcp_url` variable. Subsequent calls return the cached value without re-reading the file. To force a re-read (e.g. in tests), set `_cached_mcp_url = None`.
+
+### Debug Mode — `.env`
+
+```bash
 ALPHA_VANTAGE_DEBUG=true
 ```
 
-## 🚦 Running the Application
+The `_debug_log()` function gates all debug output behind the `ALPHA_VANTAGE_DEBUG` environment variable (truthy: `true`, `1`, `yes`). Debug calls are placed at every decision point: config resolution, ticker extraction, session lifecycle, tool invocation (including full argument dumps), response metadata, and error unwrapping. When `DEBUG=False`, `_debug_log` is a no-op — zero runtime overhead.
 
-### Start the Gradio Interface
+## Ticker Extraction Algorithm
 
-```bash
-python hello-alpha-python-gradio.py
-```
+```python
+def extract_ticker(message: str) -> str | None:
+    clean_message = re.sub(r'[^\w\s]', '', message).upper()
+    words = re.findall(r'\b[A-Z]{1,5}\b', clean_message)
 
-This will:
-- Load MCP configuration from `.vscode/mcp.json`
-- Start the Gradio web server (default: http://127.0.0.1:7860)
-- Display the "Alpha Vantage Assistant" chat interface
-
-### Example Queries
-
-Try these natural language queries in the chat interface:
-
-- "What's happening with TSLA?"
-- "Check current quote value for NVDA"
-- "AAPL stock price today"
-- "Show me information about Microsoft"
-
-## 🔧 Configuration
-
-### MCP Server Configuration
-
-The application requires MCP configuration in `.vscode/mcp.json`:
-
-```json
-{
-  "servers": {
-    "alphavantage": {
-      "type": "http",
-      "url": "http://your-server-endpoint:port"
+    common_words = {
+        'WHATS', 'WHAT', 'THE', 'WITH', 'CHECK', 'HAPPENING', 'CURRENT', 'FOR',
+        'VALUE', 'TODAY', 'TOMORROW', 'PRICE', 'QUOTE', 'HOW', 'IS', 'ARE', 'ABOUT',
+        'OF', 'IN', 'MY', 'ON', 'AND', 'PLEASE', 'SHOW', 'ME', 'CAN', 'YOU', 'TELL',
+        'LOOKING', 'REPORT', 'LATEST', 'UPDATE', 'OVERVIEW', 'NOW', 'HELLO', 'THERE',
+        'THANKS', 'THANK', 'HEY', 'PLEASE', 'GIVE', 'ME', 'MORE', 'INFORMATION', 'INFO'
     }
-  }
-}
+    for word in reversed(words):
+        if word not in common_words:
+            return word
+    return None
 ```
 
-**Configuration Validation:**
-- Server type must be `"http"`
-- URL must be a valid HTTP endpoint
-- Server name `"alphavantage"` is required
+Pipeline:
+1. **Sanitize** — strip punctuation (`[^\w\s]`), uppercase.
+2. **Tokenize** — regex `\b[A-Z]{1,5}\b` extracts 1–5 character uppercase words (NYSE/NASDAQ range).
+3. **Filter** — reverse scan skipping entries in the `common_words` set. Returns the first non-stop-word candidate.
 
-### Environment Variables
+**Known limitation**: Tickers that collide with stop-words (e.g. `NOW` for ServiceNow Inc., `INFO` for Informatica Inc.) are incorrectly filtered out.
 
-Optional environment variables for enhanced functionality:
+## API Reference
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ALPHA_VANTAGE_DEBUG` | `false` | Enable verbose debug logging (true/false/1/yes) |
+### `load_mcp_config_from_vscode(server_name: str = "alphavantage") -> str`
 
-## 🧪 Testing
+Parses `.vscode/mcp.json` relative to the script directory. Returns the server URL string. Result is cached in `_cached_mcp_url`.
 
-### Run All Tests
+### `extract_ticker(message: str) -> str | None`
+
+Extracts a stock ticker from free-form user input. Returns `None` if no valid candidate found.
+
+### `async call_alpha_vantage_mcp(ticker: str) -> str`
+
+Executes an MCP transaction: config load → transport open → session init → `TOOL_CALL(GLOBAL_QUOTE)` → response extraction. Returns the quote text or a markdown-formatted error string. Never raises — all exceptions are caught and formatted.
+
+### `async chat_with_mcp(message: str, history: list) -> str`
+
+Gradio ChatInterface callback. Extracts ticker, calls MCP, formats result as:
+
+```
+### Analysis for **TICKER** via Workspace Protocol Hub:
+
+{mcp_response}
+```
+
+Returns an error message if ticker extraction fails.
+
+### `_unwrap_exceptions(exc: BaseException) -> list[str]`
+
+Recursively flattens `ExceptionGroup` trees via BFS with `id()` cycle detection. Returns leaf exceptions as `"TypeName: message"` strings.
+
+### `_extract_text_from_content(content) -> str | None`
+
+Scans MCP response content list for the first item exposing a `.text` attribute. Safe against empty lists and non-text content types.
+
+## Test Suite
 
 ```bash
+cd alpha-vantage
 pytest test_hello_alpha.py -v
 ```
 
-### Test Categories
+**21 tests**, all pass. `gradio` and `mcp` packages are **not** required at test time.
 
-#### Configuration Tests (`TestLoadMcpConfig`)
-- ✅ Valid configuration loading
-- ✅ Configuration file not found handling
-- ✅ Server name validation
-- ✅ Transport type validation
+### Module Stubbing
 
-#### Ticker Extraction Tests (`TestExtractTicker`)
-- ✅ Valid ticker symbol extraction
-- ✅ Multiple symbols handling
-- ✅ No valid symbol handling
-- ✅ Case-insensitive extraction
-
-#### MCP Integration Tests (`TestCallAlphaVantageMcp`)
-- ✅ Successful MCP calls
-- ✅ Configuration error handling
-- ✅ Empty response handling
-- ✅ Protocol error scenarios
-
-#### Chat Interface Tests (`TestChatWithMcp`)
-- ✅ Valid ticker queries
-- ✅ Invalid input handling
-- ✅ Message formatting
-
-### Example Test Commands
-
-```bash
-# Run specific test class
-pytest test_hello_alpha.py::TestExtractTicker -v
-
-# Run with coverage
-pytest test_hello_alpha.py --cov=. --cov-report=html
-
-# Run with debug output
-pytest test_hello_alpha.py -v -s
-```
-
-## 🔌 API Reference
-
-### Core Functions
-
-#### `load_mcp_config_from_vscode(server_name: str) -> str`
-
-Parses `.vscode/mcp.json` to fetch MCP server configuration.
-
-**Parameters:**
-- `server_name` - Server identifier (default: "alphavantage")
-
-**Returns:**
-- `str` - MCP endpoint URL
-
-**Raises:**
-- `FileNotFoundError` - Configuration file missing
-- `KeyError` - Server name not found
-- `ValueError` - Invalid transport type or missing URL
-
-**Features:**
-- URL caching for performance optimization
-- Comprehensive validation
-- Debug logging support
-
----
-
-#### `extract_ticker(message: str) -> str | None`
-
-Extracts stock ticker symbol from user message using regex patterns.
-
-**Parameters:**
-- `message` - User's natural language query
-
-**Returns:**
-- `str | None` - Extracted ticker symbol or None if not found
-
-**Algorithm:**
-1. Remove special characters and convert to uppercase
-2. Find 1-5 letter uppercase words
-3. Filter out common English words
-4. Return last valid ticker (often most relevant in queries)
-
----
-
-#### `async call_alpha_vantage_mcp(ticker: str) -> str`
-
-Executes MCP transaction for stock quote retrieval.
-
-**Parameters:**
-- `ticker` - Stock ticker symbol
-
-**Returns:**
-- `str` - Formatted stock quote data or error message
-
-**Error Handling:**
-- Configuration errors with detailed messages
-- Protocol errors with exception details
-- Empty response handling
-- Sub-exception reporting for ExceptionGroup
-
----
-
-#### `async chat_with_mcp(message: str, history: list) -> str`
-
-Main Gradio chat interface function for user interaction.
-
-**Parameters:**
-- `message` - User's query message
-- `history` - Chat history array
-
-**Returns:**
-- `str` - Formatted analysis response with ticker and MCP data
-
-**Workflow:**
-1. Extract ticker from user message
-2. Validate ticker extraction
-3. Call Alpha Vantage MCP
-4. Format response with markdown structure
-
-## 🏗️ Technical Architecture
-
-### Async Design Pattern
-
-The application follows async/await patterns for optimal performance:
+The test module injects `MagicMock` stubs into `sys.modules` before importing the application:
 
 ```python
-async def call_alpha_vantage_mcp(ticker: str) -> str:
-    # Non-blocking MCP client initialization
-    async with streamablehttp_client(url) as (read_stream, write_stream, _):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            response = await session.call_tool(...)
+if "gradio" not in sys.modules:
+    sys.modules["gradio"] = MagicMock()
+if "mcp" not in sys.modules:
+    sys.modules["mcp"] = MagicMock()
+    sys.modules["mcp.client"] = MagicMock()
+    sys.modules["mcp.client.streamable_http"] = MagicMock()
 ```
 
-### MCP Protocol Flow
+This eliminates the need for `gradio` and `mcp` as test-time dependencies. The application module is loaded via `importlib.util.spec_from_file_location` since it's a standalone script (not a package).
 
-1. **Configuration Loading**: Parse `.vscode/mcp.json` with validation
-2. **Connection Establishment**: Create streamable HTTP client
-3. **Session Initialization**: Initialize MCP session
-4. **Tool Execution**: Call `get_stock_quote` tool with ticker parameter
-5. **Response Processing**: Extract and format returned data
+### Test Classes
 
-### Ticker Extraction Algorithm
+| Class | Count | Type | Key Assertions |
+|---|---|---|---|
+| `TestExtractTicker` | 4 | sync | Valid symbol, multi-symbol, no-symbol, lowercase |
+| `TestLoadMcpConfig` | 4 | sync | Success, file-not-found, server-not-found, invalid-type |
+| `TestCallAlphaVantageMcp` | 5 | async | Success (verifies `TOOL_CALL`/`GLOBAL_QUOTE`/JSON args), config-error, empty-response, server-error (`isError`), non-text-content |
+| `TestChatWithMcp` | 2 | async | Valid-ticker flow, invalid-input message |
+| `TestUnwrapExceptions` | 4 | sync | Single exception, one-level group, deeply nested groups, multi-leaf group |
+| `TestProtocolErrorReporting` | 2 | async | NVDA failure reproduction (2-level nesting), plain exception |
 
-The intelligent ticker extraction uses:
-- Regex pattern matching for 1-5 letter uppercase words
-- Common word filtering (excludes "WHAT", "PRICE", "CHECK", etc.)
-- Reverse scanning for relevance (last ticker often most important)
-- Case-insensitive processing
+### Async Test Configuration
 
-### Error Handling Strategy
+`pytest-asyncio` is configured in **strict mode** (`mode=Mode.STRICT`), requiring `@pytest.mark.asyncio` on each async test class. Without the decorator, async test methods are not collected.
 
-Comprehensive error handling at multiple levels:
+### Key Test: Corrected MCP Invocation
 
-**Configuration Level:**
-- File existence validation
-- JSON parsing error handling
-- Schema validation (type, URL presence)
-
-**Protocol Level:**
-- Connection error catching
-- Exception group sub-exception extraction
-- Empty response detection
-
-**User Interface Level:**
-- Friendly error messages with markdown formatting
-- Debug information when enabled
-- Graceful fallback for invalid inputs
-
-## 🔍 Debugging
-
-### Enable Debug Mode
-
-Set environment variable or create `.env` file:
-
-```bash
-export ALPHA_VANTAGE_DEBUG=true
-```
-
-Or create `.env` file:
-```
-ALPHA_VANTAGE_DEBUG=true
-```
-
-### Debug Output
-
-Debug mode provides detailed logging:
-- Configuration loading steps
-- URL resolution and caching
-- Ticker extraction process
-- MCP connection details
-- Response metadata
-- Error stack traces
-
-### Common Issues
-
-**Configuration File Not Found:**
-```
-FileNotFoundError: Configuration profile missing at location: '.vscode/mcp.json'
-```
-Ensure `.vscode/mcp.json` exists in the application directory.
-
-**Server Type Invalid:**
-```
-ValueError: Invalid transport schema 'websocket'. Expected 'http'.
-```
-Verify server type is set to `"http"` in configuration.
-
-**Connection Timeout:**
-```
-Protocol Transport Fault: Unable to fulfill network transaction
-```
-Check MCP server endpoint accessibility and network connectivity.
-
-## 🎓 Usage Examples
-
-### Basic Query
+`test_call_alpha_vantage_mcp_success` asserts the exact call signature:
 
 ```python
-result = await chat_with_mcp("What's the price of AAPL?", [])
-# Returns: "### Analysis for **AAPL** via Workspace Protocol Hub:\n\n{stock_data}"
+mock_session.call_tool.assert_called_once()
+call_kwargs = mock_session.call_tool.call_args
+assert call_kwargs.kwargs.get("name") == "TOOL_CALL"
+args = call_kwargs.kwargs.get("arguments")
+assert args["tool_name"] == "GLOBAL_QUOTE"
+parsed = json.loads(args["arguments"])
+assert parsed == {"symbol": "AAPL"}
 ```
 
-### MCP Configuration Loading
+This test guards against regression to the pre-fix `get_stock_quote` invocation.
 
-```python
-url = load_mcp_config_from_vscode("alphavantage")
-# Returns: "http://localhost:3000"
+## Dependencies
+
+```
+gradio              # Chat interface framework
+mcp                 # Model Context Protocol client (>=1.27.0, streamable_http transport)
+python-dotenv       # .env loading
+pytest>=7.0.0       # Test runner
+pytest-asyncio>=0.21.0  # Async test support (strict mode)
 ```
 
-### Ticker Extraction
+## MCP Server Reference
 
-```python
-ticker = extract_ticker("Check current value for NVDA")
-# Returns: "NVDA"
+| Property | Value |
+|---|---|
+| URL | `https://mcp.alphavantage.co/mcp?apikey={KEY}` |
+| Transport | Streamable HTTP (POST requests, SSE for server-initiated) |
+| Protocol Version | `2024-11-05` (auto-negotiated) |
+| Session Model | Stateless; `mcp-session-id` header returned |
+| Authentication | API key in query parameter |
+| Rate Limit | 25 requests/day (free tier) |
 
-ticker = extract_ticker("What's the weather?")
-# Returns: None
-```
+## Common Errors
 
-### Direct MCP Call
+### "Protocol Transport Fault: Session terminated"
 
-```python
-quote = await call_alpha_vantage_mcp("TSLA")
-# Returns: Formatted stock quote data
-```
+Cause: HTTP 404 from unknown tool name. The streamable-HTTP transport interprets 404 as a transport failure. Fix: Use `TOOL_CALL` meta-tool, not direct function names like `get_stock_quote`.
 
-## 🔒 Security Considerations
+### "Configuration profile missing at location"
 
-### Configuration Security
-- Store MCP endpoints in configuration files, not hardcoded
-- Use environment variables for sensitive data
-- Avoid committing `.env` files to version control
+Cause: `.vscode/mcp.json` not found relative to the script directory. Fix: Create the config file (see Configuration System above).
 
-### Input Validation
-- Ticker extraction filters common words to prevent injection
-- MCP tool calls validate ticker format
-- Error messages don't expose internal details
+### "Invalid transport schema 'websocket'"
 
-### Network Security
-- Supports HTTP/HTTPS endpoints
-- No credentials stored in application code
-- Configuration-based endpoint management
+Cause: Server `type` field is not `"http"`. The application only supports HTTP transport. Fix: Set `"type": "http"` in the config.
 
-## 📚 Additional Resources
+### API Rate Limit
 
-- [Gradio Documentation](https://www.gradio.app/docs)
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [Alpha Vantage API](https://www.alphavantage.co/documentation/)
-- [Python Async/Await Patterns](https://docs.python.org/3/library/asyncio.html)
-
-## 🤝 Contributing
-
-Contributions are welcome! Please ensure:
-- All tests pass with `pytest -v`
-- Async functions maintain proper error handling
-- Debug logging is comprehensive
-- Documentation is updated for new features
-
-## 📄 License
-
-See parent LICENSE file for details.
+The Alpha Vantage free tier allows 25 requests/day. When exceeded, the server returns an `Information` note in the response text (not an error). This is surfaced as informational content, not as a `Protocol Transport Fault`.
