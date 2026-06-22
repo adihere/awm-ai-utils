@@ -462,9 +462,13 @@ class TestRenderChartjsHtml:
             "sentiment": {"label": "bullish", "score": 0.8},
         }
         out = render_chartjs_html(parsed, "AAPL")
+        # The chart is delivered inside an iframe srcdoc so that Gradio's
+        # innerHTML injection still executes the Chart.js scripts.
+        assert out.startswith('<iframe srcdoc="') and out.endswith("</iframe>")
         assert "cdn.jsdelivr.net/npm/chart.js" in out
-        assert 'id="av-metrics"' in out
-        assert 'id="av-sentiment"' in out
+        # Markers are HTML-escaped within the srcdoc attribute.
+        assert 'id=&quot;av-metrics&quot;' in out
+        assert 'id=&quot;av-sentiment&quot;' in out
         assert "JSON.parse(" in out
 
     def test_payload_is_escaped(self):

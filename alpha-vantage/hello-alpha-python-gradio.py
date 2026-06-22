@@ -358,6 +358,13 @@ def render_chartjs_html(parsed: dict | None, ticker: str,
     When AI output is unavailable (no key, failure, or empty payload) a styled,
     visible notice is returned instead of an invisible comment so the Charts
     panel is never mysteriously blank.
+
+    The chart document is delivered inside an ``<iframe srcdoc="...">`` wrapper.
+    Gradio injects ``gr.HTML`` content via ``innerHTML``, which does NOT execute
+    ``<script>`` tags — so a bare Chart.js template would silently fail to draw
+    (and log a warning). An iframe loads its own document where scripts run
+    normally, sidestepping both problems. The full template is HTML-escaped into
+    the ``srcdoc`` attribute, preserving the existing JSON-payload injection.
     """
     if status == AI_STATUS_NO_KEY:
         reason = "No <code>OPENAI_API_KEY</code> configured. Add one to " \
@@ -374,7 +381,13 @@ def render_chartjs_html(parsed: dict | None, ticker: str,
     # Escape the JSON before embedding so model/user text cannot break out of
     # the script context.
     payload_json = html.escape(json.dumps(safe_payload), quote=True)
-    return _CHART_TEMPLATE.replace("__DATA__", "JSON.parse('" + payload_json + "')")
+    chart_doc = _CHART_TEMPLATE.replace("__DATA__", "JSON.parse('" + payload_json + "')")
+    # Escape the whole document into the srcdoc attribute so the iframe renders
+    # it verbatim. The script-payload inside was already escaped above.
+    return (
+        '<iframe srcdoc="{srcdoc}" style="width:100%;height:280px;'
+        'border:0;frameborder:0"></iframe>'
+    ).format(srcdoc=html.escape(chart_doc, quote=True))
 
 
 async def call_alpha_vantage_mcp(ticker: str) -> str:
