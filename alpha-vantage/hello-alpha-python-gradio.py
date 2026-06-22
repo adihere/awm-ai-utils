@@ -214,6 +214,88 @@ def _unwrap_exceptions(exc: BaseException) -> list[str]:
             leaves.append(f"{type(current).__name__}: {current}")
     return leaves
 
+
+async def analyze_with_openai(quote_text: str, ticker: str) -> dict | None:
+    """Call the OpenAI model on a stock quote and return a structured payload.
+
+    Uses OpenAI structured outputs (json_schema response_format) so the result
+    matches the chart contract. Returns None when no API key is configured or
+    any error occurs, allowing the caller to fall back gracefully.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        _debug_log("OPENAI_API_KEY not set; skipping AI analysis")
+        return None
+
+    _debug_log(f"Invoking OpenAI model {OPENAI_MODEL} for ticker {ticker}")
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+        resp = await client.beta.chat.completions.parse(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a financial analyst. Given a stock quote, return: "
+                        "(1) 'analysis': a concise 3-5 sentence market read; "
+                        "(2) 'metrics': up to 6 numeric metrics derivable from the quote "
+                        "(e.g. price, change_percent, volume_in_millions, pe_ratio, "
+                        "day_range_midpoint). Only include numbers present in or directly "
+                        "derivable from the quote text. If a metric cannot be derived, omit it. "
+                        "(3) 'sentiment': a label (bullish|bearish|neutral) and a confidence "
+                        "score between 0 and 1."
+                    ),
+                },
+                {"role": "user", "content": f"Ticker: {ticker}\nQuote:\n{quote_text}"},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "stock_analysis",
+                    "schema": _ANALYSIS_SCHEMA,
+                    "strict": True,
+                },
+            },
+        )
+        parsed = resp.choices[0].message.parsed
+        _debug_log(f"OpenAI returned parsed payload: {parsed}")
+        return parsed
+    except Exception as ai_err:
+        _debug_log(f"OpenAI analysis failed: {type(ai_err).__name__}: {ai_err}")
+        return None
+
+
+def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None) -> str:
+    """Render the textual analysis. Falls back to raw quote when parsed is None."""
+    base = f"### Analysis for **{ticker}** via Workspace Protocol Hub:\n\n{quote}"
+    if not parsed:
+        return base + "\n\n_OpenAI analysis unavailable (set OPENAI_API_KEY in .env)._"
+    sentiment = parsed.get("sentiment", {}) or {}
+    label = sentiment.get("label", "n/a")
+    score = sentiment.get("score", "n/a")
+    score_display = f"{score:.2f}" if isinstance(score, (int, float)) else score
+    return (
+        f"{base}\n\n"
+        f"#### AI Analysis ({label.upper()}, confidence {score_display})\n\n"
+        f"{parsed.get('analysis', '')}"
+    )
+
+
+def render_chartjs_html(parsed: dict | None, ticker: str) -> str:
+    """Render the Chart.js visualization. Returns a disabled comment when no payload."""
+    if not parsed:
+        return "<!-- OpenAI analysis disabled: no API key or analysis failed -->"
+    safe_payload = {
+        "ticker": ticker,
+        "metrics": parsed.get("metrics", []) or [],
+        "sentiment": parsed.get("sentiment", {"label": "n/a", "score": 0}) or {},
+    }
+    # Escape the JSON before embedding so model/user text cannot break out of
+    # the script context.
+    payload_json = html.escape(json.dumps(safe_payload), quote=True)
+    return _CHART_TEMPLATE.replace("__DATA__", "JSON.parse('" + payload_json + "')")
+
+
 async def call_alpha_vantage_mcp(ticker: str) -> str:
     """
     Executes transaction tasks inside a transient stream context.
