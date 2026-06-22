@@ -189,86 +189,30 @@ def _extract_text_from_content(content) -> str | None:
     return None
 
 
-async def analyze_with_openai(quote_text: str, ticker: str) -> dict | None:
-    """Call the OpenAI model on a stock quote and return a structured payload.
+def _unwrap_exceptions(exc: BaseException) -> list[str]:
+    """Recursively flatten an exception (and any nested ExceptionGroups).
 
-    Uses OpenAI structured outputs (json_schema response_format) so the result
-    matches the chart contract. Returns None when no API key is configured or
-    any error occurs, allowing the caller to fall back gracefully.
+    The MCP streamable-HTTP transport raises ``ExceptionGroup`` (a.k.a.
+    ``BaseExceptionGroup``) instances that can wrap the real error multiple
+    layers deep. Without recursive unwrapping the user only sees the useless
+    "unhandled errors in a TaskGroup" message instead of the actionable root
+    cause (e.g. ``McpError: Session terminated``). Returns a list of
+    ``Type: message`` strings, one per leaf exception found.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        _debug_log("OPENAI_API_KEY not set; skipping AI analysis")
-        return None
-
-    _debug_log(f"Invoking OpenAI model {OPENAI_MODEL} for ticker {ticker}")
-    try:
-        client = AsyncOpenAI(api_key=api_key)
-        resp = await client.beta.chat.completions.parse(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a financial analyst. Given a stock quote, return: "
-                        "(1) 'analysis': a concise 3-5 sentence market read; "
-                        "(2) 'metrics': up to 6 numeric metrics derivable from the quote "
-                        "(e.g. price, change_percent, volume_in_millions, pe_ratio, "
-                        "day_range_midpoint). Only include numbers present in or directly "
-                        "derivable from the quote text. If a metric cannot be derived, omit it. "
-                        "(3) 'sentiment': a label (bullish|bearish|neutral) and a confidence "
-                        "score between 0 and 1."
-                    ),
-                },
-                {"role": "user", "content": f"Ticker: {ticker}\nQuote:\n{quote_text}"},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "stock_analysis",
-                    "schema": _ANALYSIS_SCHEMA,
-                    "strict": True,
-                },
-            },
-        )
-        parsed = resp.choices[0].message.parsed
-        _debug_log(f"OpenAI returned parsed payload: {parsed}")
-        return parsed
-    except Exception as ai_err:
-        _debug_log(f"OpenAI analysis failed: {type(ai_err).__name__}: {ai_err}")
-        return None
-
-
-def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None) -> str:
-    """Render the textual analysis. Falls back to raw quote when parsed is None."""
-    base = f"### Analysis for **{ticker}** via Workspace Protocol Hub:\n\n{quote}"
-    if not parsed:
-        return base + "\n\n_OpenAI analysis unavailable (set OPENAI_API_KEY in .env)._"
-    sentiment = parsed.get("sentiment", {}) or {}
-    label = sentiment.get("label", "n/a")
-    score = sentiment.get("score", "n/a")
-    score_display = f"{score:.2f}" if isinstance(score, (int, float)) else score
-    return (
-        f"{base}\n\n"
-        f"#### AI Analysis ({label.upper()}, confidence {score_display})\n\n"
-        f"{parsed.get('analysis', '')}"
-    )
-
-
-def render_chartjs_html(parsed: dict | None, ticker: str) -> str:
-    """Render the Chart.js visualization. Returns a disabled comment when no payload."""
-    if not parsed:
-        return "<!-- OpenAI analysis disabled: no API key or analysis failed -->"
-    safe_payload = {
-        "ticker": ticker,
-        "metrics": parsed.get("metrics", []) or [],
-        "sentiment": parsed.get("sentiment", {"label": "n/a", "score": 0}) or {},
-    }
-    # Escape the JSON before embedding so model/user text cannot break out of
-    # the script context.
-    payload_json = html.escape(json.dumps(safe_payload), quote=True)
-    return _CHART_TEMPLATE.replace("__DATA__", "JSON.parse('" + payload_json + "')")
-
+    leaves: list[str] = []
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        sub_excs = getattr(current, "exceptions", None)
+        if sub_excs:
+            queue.extend(sub_excs)
+        else:
+            leaves.append(f"{type(current).__name__}: {current}")
+    return leaves
 
 async def call_alpha_vantage_mcp(ticker: str) -> str:
     """
@@ -294,11 +238,21 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
                 _debug_log("ClientSession created, initializing...")
                 await session.initialize()
                 _debug_log("Session initialized successfully")
-                
-                _debug_log(f"Calling tool 'get_stock_quote' with arguments: {{'ticker': '{ticker}'}}")
+
+                # The Alpha Vantage MCP server exposes a meta-tool interface
+                # (TOOL_LIST / TOOL_GET / TOOL_CALL) rather than individual
+                # endpoints. To fetch a quote we invoke TOOL_CALL which wraps
+                # the underlying GLOBAL_QUOTE Alpha Vantage function. The inner
+                # arguments MUST be a JSON-encoded string (per the TOOL_CALL
+                # schema) and GLOBAL_QUOTE expects a "symbol" parameter.
+                tool_call_args = {
+                    "tool_name": "GLOBAL_QUOTE",
+                    "arguments": json.dumps({"symbol": ticker}),
+                }
+                _debug_log(f"Calling tool 'TOOL_CALL' with arguments: {tool_call_args}")
                 response = await session.call_tool(
-                    name="get_stock_quote",
-                    arguments={"ticker": ticker}
+                    name="TOOL_CALL",
+                    arguments=tool_call_args,
                 )
                 _debug_log(f"Tool response received, content length: {len(response.content) if response.content else 0}")
                 _debug_log(f"Full response metadata: isError={getattr(response, 'isError', 'N/A')}")
@@ -322,14 +276,23 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
     except Exception as protocol_err:
         _debug_log(f"Protocol error: {type(protocol_err).__name__}: {protocol_err}")
         _debug_log(f"Full traceback:\n{traceback.format_exc()}")
-        
-        # Extract sub-exceptions from ExceptionGroup for better error reporting
-        error_details = str(protocol_err)
-        if hasattr(protocol_err, "exceptions"):
-            for sub_exc in protocol_err.exceptions:
-                _debug_log(f"  Sub-exception: {type(sub_exc).__name__}: {sub_exc}")
-                error_details += f"\n  Sub: {type(sub_exc).__name__}: {sub_exc}"
-        return f"### Protocol Transport Fault\nUnable to fulfill network transaction. Details: `{error_details}`"
+
+        # Recursively unwrap ExceptionGroup/BaseExceptionGroup instances so the
+        # actionable root cause (e.g. McpError: Session terminated) is reported
+        # instead of the opaque "unhandled errors in a TaskGroup" wrapper.
+        leaf_errors = _unwrap_exceptions(protocol_err)
+        _debug_log(f"Unwrapped leaf exceptions: {leaf_errors}")
+
+        if leaf_errors:
+            error_details = "\n".join(f"  - {leaf}" for leaf in leaf_errors)
+        else:
+            error_details = f"{type(protocol_err).__name__}: {protocol_err}"
+
+        return (
+            "### Protocol Transport Fault\n"
+            "Unable to fulfill network transaction. Root cause(s):\n"
+            f"{error_details}"
+        )
 
 async def chat_with_mcp(message: str, history: list) -> str:
     """

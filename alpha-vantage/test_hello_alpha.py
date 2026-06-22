@@ -211,6 +211,20 @@ class TestCallAlphaVantageMcp:
                     result = await call_alpha_vantage_mcp("AAPL")
                     assert "AAPL: $150.00" in result
 
+                    # Verify the corrected invocation: the Alpha Vantage MCP
+                    # server uses a meta-tool interface, so we must call
+                    # TOOL_CALL wrapping the GLOBAL_QUOTE function with a
+                    # JSON-encoded arguments string (NOT a non-existent
+                    # "get_stock_quote" tool).
+                    mock_session.call_tool.assert_called_once()
+                    call_kwargs = mock_session.call_tool.call_args
+                    assert call_kwargs.kwargs.get("name") == "TOOL_CALL" or call_kwargs[1].get("name") == "TOOL_CALL"
+                    args = call_kwargs.kwargs.get("arguments") or call_kwargs[1].get("arguments")
+                    assert args["tool_name"] == "GLOBAL_QUOTE"
+                    # Inner arguments must be a JSON string with a "symbol" key
+                    parsed = json.loads(args["arguments"])
+                    assert parsed == {"symbol": "AAPL"}
+
     async def test_call_alpha_vantage_mcp_config_error(self):
         """Test MCP call handles config loading errors."""
         with patch("hello_alpha_python_gradio.load_mcp_config_from_vscode", side_effect=FileNotFoundError("Config missing")):
@@ -385,6 +399,87 @@ class TestRenderChartjsHtml:
         out = render_chartjs_html(parsed, "AAPL")
         assert "</script>" not in out.split("JSON.parse(")[1].split("');")[0]
         assert "&lt;/script&gt;" in out
+
+
+class TestUnwrapExceptions:
+    """Test recursive unwrapping of nested ExceptionGroups.
+
+    The MCP streamable-HTTP transport wraps the real error (e.g.
+    McpError) inside multiple layers of ExceptionGroup. The unwrapper must
+    recurse to surface the actionable root cause instead of the opaque
+    "unhandled errors in a TaskGroup" message.
+    """
+
+    def test_unwraps_single_exception(self):
+        leaf = RuntimeError("Session terminated")
+        result = hello_alpha_python_gradio._unwrap_exceptions(leaf)
+        assert result == ["RuntimeError: Session terminated"]
+
+    def test_unwraps_one_level_exception_group(self):
+        leaf = ValueError("bad ticker")
+        group = ExceptionGroup("outer", [leaf])
+        result = hello_alpha_python_gradio._unwrap_exceptions(group)
+        assert result == ["ValueError: bad ticker"]
+
+    def test_unwraps_deeply_nested_exception_groups(self):
+        # Mirrors the real failure shape: ExceptionGroup(ExceptionGroup(McpError))
+        class McpError(Exception):
+            pass
+
+        leaf = McpError("Session terminated")
+        inner = ExceptionGroup("inner", [leaf])
+        outer = ExceptionGroup("outer", [inner])
+        result = hello_alpha_python_gradio._unwrap_exceptions(outer)
+        assert len(result) == 1
+        assert "Session terminated" in result[0]
+        assert "McpError" in result[0]
+
+    def test_unwraps_multiple_leaves(self):
+        leaves = [ValueError("a"), KeyError("b")]
+        group = ExceptionGroup("grp", leaves)
+        result = hello_alpha_python_gradio._unwrap_exceptions(group)
+        assert "ValueError: a" in result
+        assert "KeyError: 'b'" in result
+
+
+@pytest.mark.asyncio
+class TestProtocolErrorReporting:
+    """Test that protocol errors surface the real root cause to the user."""
+
+    async def _run_with_call_tool_raising(self, exc):
+        with patch("hello_alpha_python_gradio.load_mcp_config_from_vscode", return_value="http://localhost:3000"):
+            with patch("hello_alpha_python_gradio.streamablehttp_client") as mock_client:
+                mock_session = AsyncMock()
+                mock_session.call_tool = AsyncMock(side_effect=exc)
+                mock_session.initialize = AsyncMock()
+                mock_client.return_value.__aenter__.return_value = (AsyncMock(), AsyncMock(), AsyncMock())
+                with patch("hello_alpha_python_gradio.ClientSession") as mock_cs:
+                    mock_cs.return_value.__aenter__.return_value = mock_session
+                    return await call_alpha_vantage_mcp("AAPL")
+
+    async def test_nested_exception_group_surfaces_leaf_cause(self):
+        """Reproduces the reported NVDA failure shape and verifies the leaf
+        cause ('Session terminated') is surfaced instead of the opaque
+        'unhandled errors in a TaskGroup' wrapper."""
+        class McpError(Exception):
+            pass
+
+        leaf = McpError("Session terminated")
+        inner = ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [leaf])
+        outer = ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [inner])
+
+        result = await self._run_with_call_tool_raising(outer)
+
+        assert "Protocol Transport Fault" in result
+        assert "Session terminated" in result
+        # The opaque wrapper message must NOT be the only thing reported
+        assert result.count("unhandled errors in a TaskGroup") <= 0 or "Session terminated" in result
+
+    async def test_plain_exception_surfaces_type_and_message(self):
+        result = await self._run_with_call_tool_raising(ConnectionError("refused"))
+        assert "Protocol Transport Fault" in result
+        assert "ConnectionError" in result
+        assert "refused" in result
 
 
 if __name__ == "__main__":
