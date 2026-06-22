@@ -43,6 +43,10 @@ chat_with_mcp = hello_alpha_python_gradio.chat_with_mcp
 analyze_with_openai = hello_alpha_python_gradio.analyze_with_openai
 render_analysis_markdown = hello_alpha_python_gradio.render_analysis_markdown
 render_chartjs_html = hello_alpha_python_gradio.render_chartjs_html
+get_api_key = hello_alpha_python_gradio.get_api_key
+AI_STATUS_OK = hello_alpha_python_gradio.AI_STATUS_OK
+AI_STATUS_NO_KEY = hello_alpha_python_gradio.AI_STATUS_NO_KEY
+AI_STATUS_ERROR = hello_alpha_python_gradio.AI_STATUS_ERROR
 
 
 @pytest.fixture(autouse=True)
@@ -314,8 +318,16 @@ class TestChatWithMcp:
 class TestAnalyzeWithOpenai:
     """Test the OpenAI analysis wrapper."""
 
-    async def test_missing_key_returns_none(self):
-        assert await analyze_with_openai("quote", "AAPL") is None
+    async def test_missing_key_returns_no_key_status(self):
+        """No key resolvable from env OR .env must yield NO_KEY status.
+
+        Patches get_api_key so the test does not depend on whether a real
+        .env file happens to exist beside the script under test.
+        """
+        with patch("hello_alpha_python_gradio.get_api_key", return_value=None):
+            parsed, status = await analyze_with_openai("quote", "AAPL")
+        assert parsed is None
+        assert status == AI_STATUS_NO_KEY
 
     async def test_success_returns_parsed_payload(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
@@ -337,19 +349,23 @@ class TestAnalyzeWithOpenai:
         fake_client.beta.chat.completions.parse = AsyncMock(return_value=fake_resp)
 
         with patch("hello_alpha_python_gradio.AsyncOpenAI", return_value=fake_client):
-            result = await analyze_with_openai("AAPL: $150.00", "AAPL")
+            parsed, status = await analyze_with_openai("AAPL: $150.00", "AAPL")
 
-        assert result == parsed_payload
-        assert result["metrics"][0]["value"] == 150.0
+        assert status == AI_STATUS_OK
+        assert parsed == parsed_payload
+        assert parsed["metrics"][0]["value"] == 150.0
 
-    async def test_exception_returns_none(self, monkeypatch):
+    async def test_exception_returns_error_status(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
         fake_client = MagicMock()
         fake_client.beta.chat.completions.parse = AsyncMock(side_effect=RuntimeError("boom"))
 
         with patch("hello_alpha_python_gradio.AsyncOpenAI", return_value=fake_client):
-            assert await analyze_with_openai("quote", "AAPL") is None
+            parsed, status = await analyze_with_openai("quote", "AAPL")
+
+        assert parsed is None
+        assert status == AI_STATUS_ERROR
 
 
 class TestRenderAnalysisMarkdown:
@@ -360,14 +376,33 @@ class TestRenderAnalysisMarkdown:
             "analysis": "Strong quarter.",
             "sentiment": {"label": "bullish", "score": 0.82},
         }
-        md = render_analysis_markdown("AAPL", "AAPL: $150", parsed)
+        md = render_analysis_markdown("AAPL", "AAPL: $150", parsed, AI_STATUS_OK)
         assert "AAPL" in md
         assert "Strong quarter." in md
         assert "BULLISH" in md
         assert "0.82" in md
 
-    def test_fallback_when_none(self):
-        md = render_analysis_markdown("AAPL", "AAPL: $150", None)
+    def test_no_key_warning_shows_quote_and_fix(self):
+        """Missing key must still show the quote plus a clear, actionable warning."""
+        md = render_analysis_markdown("AAPL", "AAPL: $150", None, AI_STATUS_NO_KEY)
+        # Quote is always preserved.
+        assert "AAPL: $150" in md
+        # Clear, informative warning naming the missing key and the fix.
+        assert "AI analysis unavailable" in md
+        assert "OPENAI_API_KEY" in md
+        assert ".env" in md
+
+    def test_error_warning_shows_quote_and_diagnostics_hint(self):
+        """A failed call must show the quote plus a distinct error warning."""
+        md = render_analysis_markdown("AAPL", "AAPL: $150", None, AI_STATUS_ERROR)
+        assert "AAPL: $150" in md
+        assert "AI analysis unavailable" in md
+        # Error branch points at diagnostics, not at the missing-key fix.
+        assert "ALPHA_VANTAGE_DEBUG" in md
+
+    def test_none_payload_with_ok_status_treated_as_error(self):
+        """Defensive: parsed is None but status ok -> still warns (no crash)."""
+        md = render_analysis_markdown("AAPL", "AAPL: $150", None, AI_STATUS_OK)
         assert "AAPL: $150" in md
         assert "unavailable" in md.lower()
 
@@ -375,9 +410,18 @@ class TestRenderAnalysisMarkdown:
 class TestRenderChartjsHtml:
     """Test the Chart.js HTML renderer."""
 
-    def test_disabled_when_no_payload(self):
-        out = render_chartjs_html(None, "AAPL")
-        assert "disabled" in out
+    def test_no_key_renders_visible_notice(self):
+        out = render_chartjs_html(None, "AAPL", AI_STATUS_NO_KEY)
+        assert "Charts unavailable" in out
+        assert "OPENAI_API_KEY" in out
+
+    def test_error_renders_visible_notice(self):
+        out = render_chartjs_html(None, "AAPL", AI_STATUS_ERROR)
+        assert "Charts unavailable" in out
+
+    def test_empty_payload_renders_visible_notice(self):
+        out = render_chartjs_html(None, "AAPL", AI_STATUS_OK)
+        assert "Charts unavailable" in out
 
     def test_includes_canvas_and_cdn(self):
         parsed = {
@@ -399,6 +443,80 @@ class TestRenderChartjsHtml:
         out = render_chartjs_html(parsed, "AAPL")
         assert "</script>" not in out.split("JSON.parse(")[1].split("');")[0]
         assert "&lt;/script&gt;" in out
+
+
+class TestGetApiKey:
+    """Test get_api_key: env var priority, .env fallback, override safety."""
+
+    def test_env_var_takes_priority_over_dotenv(self, monkeypatch, tmp_path):
+        """When both env var and .env define the key, the env var wins."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("OPENAI_API_KEY=from-dotenv-file\n")
+
+        monkeypatch.setenv("OPENAI_API_KEY", "from-environment")
+        result = get_api_key("OPENAI_API_KEY", env_path=str(env_file))
+        assert result == "from-environment"
+
+    def test_falls_back_to_dotenv_when_env_absent(self, monkeypatch, tmp_path):
+        """With no env var, the .env file value is loaded and returned."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("OPENAI_API_KEY=from-dotenv-file\n")
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        result = get_api_key("OPENAI_API_KEY", env_path=str(env_file))
+        assert result == "from-dotenv-file"
+
+    def test_returns_none_when_key_nowhere(self, monkeypatch, tmp_path):
+        """None when the key is absent from both env and .env."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("SOME_OTHER_KEY=irrelevant\n")
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        result = get_api_key("OPENAI_API_KEY", env_path=str(env_file))
+        assert result is None
+
+    def test_env_var_not_overwritten_by_dotenv(self, monkeypatch, tmp_path):
+        """load_dotenv(override=False) must not clobber an existing env var.
+
+        Regression guard: calling get_api_key should never change the value
+        already present in os.environ, even if the .env file disagrees.
+        """
+        env_file = tmp_path / ".env"
+        env_file.write_text("OPENAI_API_KEY=should-not-win\n")
+
+        monkeypatch.setenv("OPENAI_API_KEY", "real-env-value")
+        result = get_api_key("OPENAI_API_KEY", env_path=str(env_file))
+        assert result == "real-env-value"
+        # The process environment must be untouched after the call.
+        assert os.environ["OPENAI_API_KEY"] == "real-env-value"
+
+    def test_quoted_dotenv_values_are_stripped(self, monkeypatch, tmp_path):
+        """python-dotenv strips surrounding quotes from .env values."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('OPENAI_API_KEY="sk-quoted"\n')
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        result = get_api_key("OPENAI_API_KEY", env_path=str(env_file))
+        assert result == "sk-quoted"
+
+    def test_analyze_uses_get_api_key(self, monkeypatch, tmp_path):
+        """analyze_with_openai must route key lookup through get_api_key so the
+        env-var-over-.env precedence applies to the AI pipeline."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("OPENAI_API_KEY=from-dotenv-file\n")
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        captured = {}
+
+        def fake_get(key_name="OPENAI_API_KEY", env_path=None):
+            captured["called"] = True
+            return None
+
+        with patch("hello_alpha_python_gradio.get_api_key", side_effect=fake_get):
+            import asyncio
+            asyncio.run(analyze_with_openai("quote", "AAPL"))
+
+        assert captured.get("called") is True
 
 
 class TestUnwrapExceptions:

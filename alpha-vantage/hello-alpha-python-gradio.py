@@ -31,6 +31,14 @@ _cached_mcp_url = None
 # (OpenAI has no model literally named "nano"; gpt-4o-mini is the equivalent.)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+# Status codes describing why AI analysis did (or did not) produce output.
+# Returning a status alongside the payload lets the renderers show a precise,
+# actionable warning (missing key vs. API failure) without disrupting the
+# stock quote that was already retrieved.
+AI_STATUS_OK = "ok"
+AI_STATUS_NO_KEY = "no_key"
+AI_STATUS_ERROR = "error"
+
 # JSON schema enforced via OpenAI structured outputs so the model returns a
 # stable contract for chart generation.
 _ANALYSIS_SCHEMA = {
@@ -102,6 +110,14 @@ const lbl = document.getElementById('av-sent-label');
 lbl.innerHTML = '<span class="av-sent" style="color:'+sColor+'">'+(DATA.sentiment && DATA.sentiment.label ? DATA.sentiment.label : 'n/a')+'</span> ('+(s*100).toFixed(0)+'%)';
 </script></body></html>
 """
+
+# Styled notice rendered into the Charts panel when AI output is unavailable,
+# so the panel is never mysteriously blank. {reason} holds a static developer
+# string (never user/model-controlled text), so it is not escaped.
+_DISABLED_NOTICE_TEMPLATE = """<div style="font-family:'Courier New','Consolas',monospace;color:#8B949E;background:#11161B;border:1px solid #1F2730;border-radius:4px;padding:12px;max-width:520px">
+<strong style="color:#EAECEF">Charts unavailable</strong><br>
+<span>{reason}</span>
+</div>"""
 
 
 def load_mcp_config_from_vscode(server_name: str = "alphavantage") -> str:
@@ -215,17 +231,61 @@ def _unwrap_exceptions(exc: BaseException) -> list[str]:
     return leaves
 
 
-async def analyze_with_openai(quote_text: str, ticker: str) -> dict | None:
+def get_api_key(key_name: str = "OPENAI_API_KEY",
+                env_path: str | None = None) -> str | None:
+    """Return the requested API key, prioritizing the environment variable.
+
+    Resolution order:
+    1. The existing process environment variable (``os.environ``) — highest
+       priority. If it is set to a non-empty value it is returned immediately
+       and the ``.env`` file is never consulted.
+    2. A value loaded from a ``.env`` file via python-dotenv, used only when
+       the variable is absent from the environment.
+
+    python-dotenv is invoked with ``override=False`` (its default), so a value
+    already present in the environment is never clobbered by the ``.env`` file,
+    preserving the required precedence. When python-dotenv is not installed,
+    only the environment variable is consulted.
+
+    Returns the key string when found, or None if it cannot be resolved from
+    either source.
+    """
+    existing = os.environ.get(key_name)
+    if existing:
+        _debug_log(f"API key '{key_name}' resolved from environment variable")
+        return existing
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        _debug_log("python-dotenv unavailable; cannot read .env file")
+        return None
+
+    if env_path is None:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+    # override=False (the default) guarantees an existing environment variable
+    # is never overwritten by a value from the .env file.
+    load_dotenv(env_path, override=False)
+    value = os.environ.get(key_name)
+    _debug_log(f"API key '{key_name}' resolved from .env: {bool(value)}")
+    return value
+
+
+async def analyze_with_openai(quote_text: str, ticker: str) -> tuple[dict | None, str]:
     """Call the OpenAI model on a stock quote and return a structured payload.
 
     Uses OpenAI structured outputs (json_schema response_format) so the result
-    matches the chart contract. Returns None when no API key is configured or
-    any error occurs, allowing the caller to fall back gracefully.
+    matches the chart contract. Returns a ``(parsed, status)`` tuple where
+    ``status`` is one of ``AI_STATUS_OK``, ``AI_STATUS_NO_KEY`` (no API key
+    configured), or ``AI_STATUS_ERROR`` (key present but the request failed).
+    In both non-OK cases ``parsed`` is None and the caller falls back
+    gracefully to the raw quote with an informative warning.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = get_api_key("OPENAI_API_KEY")
     if not api_key:
         _debug_log("OPENAI_API_KEY not set; skipping AI analysis")
-        return None
+        return None, AI_STATUS_NO_KEY
 
     _debug_log(f"Invoking OpenAI model {OPENAI_MODEL} for ticker {ticker}")
     try:
@@ -259,17 +319,42 @@ async def analyze_with_openai(quote_text: str, ticker: str) -> dict | None:
         )
         parsed = resp.choices[0].message.parsed
         _debug_log(f"OpenAI returned parsed payload: {parsed}")
-        return parsed
+        return parsed, AI_STATUS_OK
     except Exception as ai_err:
         _debug_log(f"OpenAI analysis failed: {type(ai_err).__name__}: {ai_err}")
-        return None
+        return None, AI_STATUS_ERROR
 
 
-def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None) -> str:
-    """Render the textual analysis. Falls back to raw quote when parsed is None."""
+def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None,
+                             status: str = AI_STATUS_OK) -> str:
+    """Render the textual analysis.
+
+    The raw stock quote is ALWAYS shown. When AI analysis is unavailable a
+    clear, actionable warning is appended (without obscuring the quote); the
+    warning differs depending on whether the key is missing or the call failed.
+    """
     base = f"### Analysis for **{ticker}** via Workspace Protocol Hub:\n\n{quote}"
-    if not parsed:
-        return base + "\n\n_OpenAI analysis unavailable (set OPENAI_API_KEY in .env)._"
+
+    if status == AI_STATUS_NO_KEY:
+        return (
+            f"{base}\n\n"
+            "> **AI analysis unavailable** — the `OPENAI_API_KEY` environment "
+            "variable is not set, so the AI-powered summary and charts were "
+            "skipped. The stock quote above is unaffected.\n\n"
+            "> To enable AI analysis, add a valid key to `alpha-vantage/.env`:\n"
+            ">\n> ```\n> OPENAI_API_KEY=sk-...\n> ```"
+        )
+
+    if status == AI_STATUS_ERROR or parsed is None:
+        return (
+            f"{base}\n\n"
+            "> **AI analysis unavailable** — a key is configured, but the "
+            "request to the OpenAI model could not be completed (network error, "
+            "invalid key, rate limit, or model error). Charts were skipped.\n\n"
+            "> Verify the key and `OPENAI_MODEL` value, or set "
+            "`ALPHA_VANTAGE_DEBUG=true` for diagnostic details."
+        )
+
     sentiment = parsed.get("sentiment", {}) or {}
     label = sentiment.get("label", "n/a")
     score = sentiment.get("score", "n/a")
@@ -281,10 +366,21 @@ def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None) -> st
     )
 
 
-def render_chartjs_html(parsed: dict | None, ticker: str) -> str:
-    """Render the Chart.js visualization. Returns a disabled comment when no payload."""
-    if not parsed:
-        return "<!-- OpenAI analysis disabled: no API key or analysis failed -->"
+def render_chartjs_html(parsed: dict | None, ticker: str,
+                        status: str = AI_STATUS_OK) -> str:
+    """Render the Chart.js visualization.
+
+    When AI output is unavailable (no key, failure, or empty payload) a styled,
+    visible notice is returned instead of an invisible comment so the Charts
+    panel is never mysteriously blank.
+    """
+    if status == AI_STATUS_NO_KEY:
+        reason = "No <code>OPENAI_API_KEY</code> configured. Add one to " \
+                 "<code>alpha-vantage/.env</code> to generate charts."
+        return _DISABLED_NOTICE_TEMPLATE.format(reason=reason)
+    if status == AI_STATUS_ERROR or not parsed:
+        reason = "AI analysis could not be completed. Charts were skipped."
+        return _DISABLED_NOTICE_TEMPLATE.format(reason=reason)
     safe_payload = {
         "ticker": ticker,
         "metrics": parsed.get("metrics", []) or [],
@@ -401,9 +497,9 @@ async def chat_with_mcp(message: str, history: list) -> str:
         _debug_log("MCP returned an error header; skipping AI analysis")
         return mcp_response, "<!-- MCP error: no chart -->"
 
-    parsed = await analyze_with_openai(mcp_response, ticker)
-    markdown = render_analysis_markdown(ticker, mcp_response, parsed)
-    chart_html = render_chartjs_html(parsed, ticker)
+    parsed, ai_status = await analyze_with_openai(mcp_response, ticker)
+    markdown = render_analysis_markdown(ticker, mcp_response, parsed, ai_status)
+    chart_html = render_chartjs_html(parsed, ticker, ai_status)
     _debug_log("=== chat_with_mcp END ===")
     return markdown, chart_html
 
