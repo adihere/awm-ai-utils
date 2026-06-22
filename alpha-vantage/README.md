@@ -131,6 +131,8 @@ Optional environment variables for enhanced functionality:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ALPHA_VANTAGE_DEBUG` | `false` | Enable verbose debug logging (true/false/1/yes) |
+| `OPENAI_API_KEY` | _(unset)_ | OpenAI API key for AI analysis. Omit to disable AI features (chat still works with raw quotes). |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model id used for analysis (the smallest/cheapest OpenAI model; no "nano" model exists). |
 
 ## 🧪 Testing
 

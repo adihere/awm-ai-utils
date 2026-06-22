@@ -40,6 +40,15 @@ load_mcp_config_from_vscode = hello_alpha_python_gradio.load_mcp_config_from_vsc
 extract_ticker = hello_alpha_python_gradio.extract_ticker
 call_alpha_vantage_mcp = hello_alpha_python_gradio.call_alpha_vantage_mcp
 chat_with_mcp = hello_alpha_python_gradio.chat_with_mcp
+analyze_with_openai = hello_alpha_python_gradio.analyze_with_openai
+render_analysis_markdown = hello_alpha_python_gradio.render_analysis_markdown
+render_chartjs_html = hello_alpha_python_gradio.render_chartjs_html
+
+
+@pytest.fixture(autouse=True)
+def _no_openai_key(monkeypatch):
+    """Ensure tests run without a real OpenAI key by default."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
 class TestExtractTicker:
@@ -272,15 +281,110 @@ class TestChatWithMcp:
 
             result = await chat_with_mcp("What about TSLA?", [])
 
-            assert "TSLA" in result
-            assert "Stock data here" in result
+            assert isinstance(result, tuple)
+            markdown, chart_html = result
+            assert "TSLA" in markdown
+            assert "Stock data here" in markdown
             mock_call.assert_called_once_with("TSLA")
 
     async def test_chat_with_invalid_input(self):
         """Test chat function with no extractable ticker."""
         result = await chat_with_mcp("Hello there, how are you?", [])
 
-        assert "couldn't isolate" in result.lower()
+        assert isinstance(result, tuple)
+        markdown, chart_html = result
+        assert "couldn't isolate" in markdown.lower()
+
+
+@pytest.mark.asyncio
+class TestAnalyzeWithOpenai:
+    """Test the OpenAI analysis wrapper."""
+
+    async def test_missing_key_returns_none(self):
+        assert await analyze_with_openai("quote", "AAPL") is None
+
+    async def test_success_returns_parsed_payload(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        parsed_payload = {
+            "analysis": "Bullish momentum.",
+            "metrics": [{"label": "price", "value": 150.0}],
+            "sentiment": {"label": "bullish", "score": 0.8},
+        }
+
+        fake_message = MagicMock()
+        fake_message.parsed = parsed_payload
+        fake_choice = MagicMock()
+        fake_choice.message = fake_message
+        fake_resp = MagicMock()
+        fake_resp.choices = [fake_choice]
+
+        fake_client = MagicMock()
+        fake_client.beta.chat.completions.parse = AsyncMock(return_value=fake_resp)
+
+        with patch("hello_alpha_python_gradio.AsyncOpenAI", return_value=fake_client):
+            result = await analyze_with_openai("AAPL: $150.00", "AAPL")
+
+        assert result == parsed_payload
+        assert result["metrics"][0]["value"] == 150.0
+
+    async def test_exception_returns_none(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        fake_client = MagicMock()
+        fake_client.beta.chat.completions.parse = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with patch("hello_alpha_python_gradio.AsyncOpenAI", return_value=fake_client):
+            assert await analyze_with_openai("quote", "AAPL") is None
+
+
+class TestRenderAnalysisMarkdown:
+    """Test the markdown renderer."""
+
+    def test_with_parsed_payload(self):
+        parsed = {
+            "analysis": "Strong quarter.",
+            "sentiment": {"label": "bullish", "score": 0.82},
+        }
+        md = render_analysis_markdown("AAPL", "AAPL: $150", parsed)
+        assert "AAPL" in md
+        assert "Strong quarter." in md
+        assert "BULLISH" in md
+        assert "0.82" in md
+
+    def test_fallback_when_none(self):
+        md = render_analysis_markdown("AAPL", "AAPL: $150", None)
+        assert "AAPL: $150" in md
+        assert "unavailable" in md.lower()
+
+
+class TestRenderChartjsHtml:
+    """Test the Chart.js HTML renderer."""
+
+    def test_disabled_when_no_payload(self):
+        out = render_chartjs_html(None, "AAPL")
+        assert "disabled" in out
+
+    def test_includes_canvas_and_cdn(self):
+        parsed = {
+            "metrics": [{"label": "price", "value": 150.0}],
+            "sentiment": {"label": "bullish", "score": 0.8},
+        }
+        out = render_chartjs_html(parsed, "AAPL")
+        assert "cdn.jsdelivr.net/npm/chart.js" in out
+        assert 'id="av-metrics"' in out
+        assert 'id="av-sentiment"' in out
+        assert "JSON.parse(" in out
+
+    def test_payload_is_escaped(self):
+        """Model text must not be able to break out of the script context."""
+        parsed = {
+            "metrics": [{"label": "price</script><script>alert(1)</script>", "value": 1}],
+            "sentiment": {"label": "neutral", "score": 0.5},
+        }
+        out = render_chartjs_html(parsed, "AAPL")
+        assert "</script>" not in out.split("JSON.parse(")[1].split("');")[0]
+        assert "&lt;/script&gt;" in out
 
 
 if __name__ == "__main__":
