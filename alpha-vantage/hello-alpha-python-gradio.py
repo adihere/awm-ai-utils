@@ -7,6 +7,8 @@ import gradio as gr
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
+from typing import List
 
 # Load environment variables from .env file if it exists
 try:
@@ -39,37 +41,24 @@ AI_STATUS_OK = "ok"
 AI_STATUS_NO_KEY = "no_key"
 AI_STATUS_ERROR = "error"
 
-# JSON schema enforced via OpenAI structured outputs so the model returns a
-# stable contract for chart generation.
-_ANALYSIS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "analysis": {"type": "string"},
-        "metrics": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "label": {"type": "string"},
-                    "value": {"type": "number"},
-                },
-                "required": ["label", "value"],
-                "additionalProperties": False,
-            },
-        },
-        "sentiment": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "score": {"type": "number"},
-            },
-            "required": ["label", "score"],
-            "additionalProperties": False,
-        },
-    },
-    "required": ["analysis", "metrics", "sentiment"],
-    "additionalProperties": False,
-}
+# JSON contract enforced via OpenAI structured outputs. Pydantic models are
+# passed directly into response_format so the SDK validates/parse the response
+# into a typed object; we then .model_dump() it back to a plain dict so the
+# existing chart/rendering code (which expects dicts) works unmodified.
+class MetricItem(BaseModel):
+    label: str
+    value: float
+
+
+class SentimentInfo(BaseModel):
+    label: str
+    score: float
+
+
+class StockAnalysis(BaseModel):
+    analysis: str
+    metrics: List[MetricItem]
+    sentiment: SentimentInfo
 
 # Chart.js template rendered inside a gr.HTML component. The model's structured
 # payload is injected as an escaped JSON string and decoded at runtime to avoid
@@ -308,18 +297,14 @@ async def analyze_with_openai(quote_text: str, ticker: str) -> tuple[dict | None
                 },
                 {"role": "user", "content": f"Ticker: {ticker}\nQuote:\n{quote_text}"},
             ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "stock_analysis",
-                    "schema": _ANALYSIS_SCHEMA,
-                    "strict": True,
-                },
-            },
+            response_format=StockAnalysis,
         )
         parsed = resp.choices[0].message.parsed
-        _debug_log(f"OpenAI returned parsed payload: {parsed}")
-        return parsed, AI_STATUS_OK
+        # Convert the Pydantic object back to a dict so the existing rendering
+        # code (which operates on dicts) works unmodified.
+        parsed_dict = parsed.model_dump() if parsed else None
+        _debug_log(f"OpenAI returned parsed payload: {parsed_dict}")
+        return parsed_dict, AI_STATUS_OK
     except Exception as ai_err:
         _debug_log(f"OpenAI analysis failed: {type(ai_err).__name__}: {ai_err}")
         return None, AI_STATUS_ERROR

@@ -338,8 +338,13 @@ class TestAnalyzeWithOpenai:
             "sentiment": {"label": "bullish", "score": 0.8},
         }
 
+        # The SDK parses the response into a StockAnalysis Pydantic instance;
+        # model_dump() then converts it back to a dict for the renderers.
+        StockAnalysis = hello_alpha_python_gradio.StockAnalysis
+        parsed_model = StockAnalysis.model_validate(parsed_payload)
+
         fake_message = MagicMock()
-        fake_message.parsed = parsed_payload
+        fake_message.parsed = parsed_model
         fake_choice = MagicMock()
         fake_choice.message = fake_message
         fake_resp = MagicMock()
@@ -366,6 +371,34 @@ class TestAnalyzeWithOpenai:
 
         assert parsed is None
         assert status == AI_STATUS_ERROR
+
+    async def test_response_format_is_pydantic_model(self, monkeypatch):
+        """analyze_with_openai must pass the StockAnalysis Pydantic class
+        directly into response_format (not a raw json_schema dict)."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        StockAnalysis = hello_alpha_python_gradio.StockAnalysis
+        parsed_model = StockAnalysis.model_validate({
+            "analysis": "ok",
+            "metrics": [],
+            "sentiment": {"label": "neutral", "score": 0.5},
+        })
+
+        fake_message = MagicMock()
+        fake_message.parsed = parsed_model
+        fake_choice = MagicMock()
+        fake_choice.message = fake_message
+        fake_resp = MagicMock()
+        fake_resp.choices = [fake_choice]
+
+        fake_client = MagicMock()
+        fake_client.beta.chat.completions.parse = AsyncMock(return_value=fake_resp)
+
+        with patch("hello_alpha_python_gradio.AsyncOpenAI", return_value=fake_client):
+            await analyze_with_openai("quote", "AAPL")
+
+        call_kwargs = fake_client.beta.chat.completions.parse.call_args.kwargs
+        assert call_kwargs["response_format"] is StockAnalysis
 
 
 class TestRenderAnalysisMarkdown:
