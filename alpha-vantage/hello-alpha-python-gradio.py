@@ -625,8 +625,11 @@ async def chat_with_mcp(message: str, history: list, use_grok: bool = False) -> 
 
     if use_grok and openai_status != AI_STATUS_NO_KEY:
         grok_parsed, grok_status, social_sources = await analyze_with_grok(mcp_response, ticker)
-        if grok_status == AI_STATUS_OK and grok_parsed and openai_parsed:
-            merged_parsed = _merge_results(openai_parsed, grok_parsed)
+        if grok_status == AI_STATUS_OK and grok_parsed:
+            if openai_parsed:
+                merged_parsed = _merge_results(openai_parsed, grok_parsed)
+            else:
+                merged_parsed = grok_parsed
         else:
             merged_parsed = openai_parsed
             if grok_status == AI_STATUS_GK_NO_KEY:

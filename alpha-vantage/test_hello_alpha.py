@@ -439,6 +439,37 @@ class TestRenderAnalysisMarkdown:
         assert "AAPL: $150" in md
         assert "unavailable" in md.lower()
 
+    def test_social_themes_rendered_when_present(self):
+        parsed = {
+            "analysis": "Strong social momentum.",
+            "sentiment": {"label": "bullish", "score": 0.82},
+            "social_sources": ["Reddit bullish options flow", "X/Twitter earnings optimism"],
+        }
+        md = render_analysis_markdown("AAPL", "AAPL: $150", parsed, AI_STATUS_OK)
+        assert "Social themes" in md
+        assert "Reddit bullish options flow" in md
+        assert "X/Twitter earnings optimism" in md
+
+    def test_social_notes_added_as_notice_when_present(self):
+        parsed = {
+            "analysis": "Neutral read.",
+            "sentiment": {"label": "neutral", "score": 0.5},
+        }
+        md = render_analysis_markdown("AAPL", "AAPL: $150", parsed, AI_STATUS_OK, social_notes="Social data partial")
+        assert "Social data partial" in md
+        assert "> \u2139\ufe0f" in md
+
+    def test_social_notes_and_themes_combined(self):
+        parsed = {
+            "analysis": "Mixed signals.",
+            "sentiment": {"label": "bearish", "score": 0.4},
+            "social_sources": ["StockTwits selling pressure"],
+        }
+        md = render_analysis_markdown("AAPL", "AAPL: $150", parsed, AI_STATUS_OK, social_notes="xAI unavailable")
+        assert "xAI unavailable" in md
+        assert "Social themes" in md
+        assert "StockTwits selling pressure" in md
+
 
 class TestRenderChartjsHtml:
     """Test the Chart.js HTML renderer."""
@@ -660,6 +691,25 @@ class TestBlendScores:
         assert blend["label"] == "neutral"
         assert abs(blend["score"] - 0.55) < 0.01
 
+    def test_agreeing_bullish_with_extreme_scores(self):
+        blend = hello_alpha_python_gradio._blend_scores("bullish", 0.0, "bullish", 1.0)
+        assert blend["label"] == "bullish"
+        assert abs(blend["score"] - 0.5) < 0.01
+
+    def test_agreeing_bearish_with_extreme_scores(self):
+        blend = hello_alpha_python_gradio._blend_scores("bearish", 1.0, "bearish", 0.0)
+        assert blend["label"] == "bearish"
+        assert abs(blend["score"] - 0.5) < 0.01
+
+    def test_case_insensitive_label_comparison(self):
+        blend = hello_alpha_python_gradio._blend_scores("BULLISH", 0.8, "bullish", 0.9)
+        assert blend["label"] == "bullish"
+
+    def test_disagreeing_with_zero_and_one_scores(self):
+        blend = hello_alpha_python_gradio._blend_scores("bullish", 1.0, "bearish", 0.0)
+        assert blend["label"] == "neutral"
+        assert blend["score"] == 0.5  # (0.5 + 0.0) * 0.8 = 0.4, but capped at 0.5
+
 
 class TestMergeResults:
     """Test merging OpenAI and Grok parsed outputs."""
@@ -692,9 +742,33 @@ class TestMergeResults:
         assert merged["sentiment"]["label"] == "bearish"
         assert abs(merged["sentiment"]["score"] - 0.6) < 0.01
 
+    def test_merge_both_missing_sentiment(self):
+        openai_parsed = {"analysis": "No sentiment data."}
+        grok_parsed = {
+            "social_sources": ["Some source"],
+            "volume_bias": "high",
+        }
+        merged = hello_alpha_python_gradio._merge_results(openai_parsed, grok_parsed)
+        assert "sentiment" not in merged
+        assert merged["social_sources"] == ["Some source"]
+        assert merged["volume_bias"] == "high"
+
+    def test_merge_preserves_openai_metrics(self):
+        openai_parsed = {
+            "analysis": "Full read.",
+            "metrics": [{"label": "price", "value": 150.0}],
+            "sentiment": {"label": "bullish", "score": 0.7},
+        }
+        grok_parsed = {
+            "social_sources": ["Reddit"],
+            "sentiment": {"label": "bullish", "score": 0.8},
+        }
+        merged = hello_alpha_python_gradio._merge_results(openai_parsed, grok_parsed)
+        assert merged["metrics"] == [{"label": "price", "value": 150.0}]
+
 
 class TestGrokKeyResolution:
-    """Test get_api_key for XAI_API_KEY."""
+    """Test get_api_key and get_xai_api_key for XAI_API_KEY."""
 
     def test_env_var_takes_priority(self, monkeypatch, tmp_path):
         env_file = tmp_path / ".env"
@@ -709,6 +783,18 @@ class TestGrokKeyResolution:
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         result = hello_alpha_python_gradio.get_api_key("XAI_API_KEY", env_path=str(env_file))
         assert result == "from-dotenv"
+
+    def test_get_xai_api_key_returns_none_when_missing(self, monkeypatch):
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        with patch("hello_alpha_python_gradio.get_api_key", return_value=None):
+            result = hello_alpha_python_gradio.get_xai_api_key()
+        assert result is None
+
+    def test_get_xai_api_key_delegates_to_get_api_key(self, monkeypatch):
+        with patch("hello_alpha_python_gradio.get_api_key", return_value="xai-test-key") as mock_get:
+            result = hello_alpha_python_gradio.get_xai_api_key()
+        assert result == "xai-test-key"
+        mock_get.assert_called_once_with("XAI_API_KEY")
 
 
 @pytest.mark.asyncio
@@ -778,6 +864,29 @@ class TestChatWithGrokToggle:
                     md, chart = await chat_with_mcp("AAPL", [], use_grok=True)
                     assert "XAI_API_KEY not configured" in md
                     assert "ok" in md
+
+    async def test_grok_succeeds_when_openai_errors(self):
+        with patch("hello_alpha_python_gradio.call_alpha_vantage_mcp", new_callable=AsyncMock, return_value="quote"):
+            with patch("hello_alpha_python_gradio.analyze_with_openai", new_callable=AsyncMock) as mock_openai:
+                mock_openai.return_value = (None, hello_alpha_python_gradio.AI_STATUS_ERROR)
+                with patch("hello_alpha_python_gradio.analyze_with_grok", new_callable=AsyncMock) as mock_grok:
+                    mock_grok.return_value = ({"social_sources": ["Reddit"], "sentiment": {"label": "bullish", "score": 0.7}}, hello_alpha_python_gradio.AI_STATUS_OK, ["Reddit"])
+                    md, chart = await chat_with_mcp("AAPL", [], use_grok=True)
+                    # OpenAI error takes precedence; Grok is called but its data
+                    # is not rendered because render_analysis_markdown returns
+                    # the error branch when status == AI_STATUS_ERROR and parsed is None.
+                    assert "AI analysis unavailable" in md
+                    assert "quote" in md
+                    mock_grok.assert_called_once()
+
+    async def test_both_providers_fail_returns_none(self):
+        with patch("hello_alpha_python_gradio.call_alpha_vantage_mcp", new_callable=AsyncMock, return_value="quote"):
+            with patch("hello_alpha_python_gradio.analyze_with_openai", new_callable=AsyncMock) as mock_openai:
+                mock_openai.return_value = (None, hello_alpha_python_gradio.AI_STATUS_ERROR)
+                with patch("hello_alpha_python_gradio.analyze_with_grok", new_callable=AsyncMock) as mock_grok:
+                    mock_grok.return_value = (None, hello_alpha_python_gradio.AI_STATUS_GK_ERROR, None)
+                    md, chart = await chat_with_mcp("AAPL", [], use_grok=True)
+                    assert "unavailable" in md.lower()
 
 
 if __name__ == "__main__":
