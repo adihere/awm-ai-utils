@@ -33,6 +33,12 @@ _cached_mcp_url = None
 # (OpenAI has no model literally named "nano"; gpt-4o-mini is the equivalent.)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+# xAI Grok model id, defaulting to grok-4.3.
+XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.3")
+
+# xAI API base URL.
+XAI_BASE_URL = os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1")
+
 # Status codes describing why AI analysis did (or did not) produce output.
 # Returning a status alongside the payload lets the renderers show a precise,
 # actionable warning (missing key vs. API failure) without disrupting the
@@ -40,6 +46,9 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 AI_STATUS_OK = "ok"
 AI_STATUS_NO_KEY = "no_key"
 AI_STATUS_ERROR = "error"
+AI_STATUS_GK_NO_KEY = "gk_no_key"
+AI_STATUS_GK_ERROR = "gk_error"
+AI_STATUS_DISABLED = "disabled"
 
 # JSON contract enforced via OpenAI structured outputs. Pydantic models are
 # passed directly into response_format so the SDK validates/parse the response
@@ -261,6 +270,108 @@ def get_api_key(key_name: str = "OPENAI_API_KEY",
     return value
 
 
+def get_xai_api_key() -> str | None:
+    """Retrieve the xAI API key with a robust fallback mechanism.
+
+    Resolution order:
+    1. System environment variable ``XAI_API_KEY`` (highest priority).
+    2. ``XAI_API_KEY`` loaded from the ``.env`` file in the script directory
+       via ``python-dotenv``, used only when the environment variable is absent.
+
+    If ``python-dotenv`` is not installed, only the environment variable is
+    consulted. Returns the key string when found, or ``None`` when missing
+    from both sources.
+    """
+    return get_api_key("XAI_API_KEY")
+
+
+def _blend_scores(openai_label: str, openai_score: float,
+                  grok_label: str, grok_score: float) -> dict:
+    openai_label = openai_label.lower().strip()
+    grok_label = grok_label.lower().strip()
+    label_agreement = (openai_label == grok_label)
+    blended_score = round(0.5 * openai_score + 0.5 * grok_score, 3)
+    if not label_agreement:
+        blended_score = round(blended_score * 0.8, 3)
+    if label_agreement:
+        final_label = openai_label
+    else:
+        final_label = "neutral"
+        blended_score = max(blended_score, 0.5)
+    return {"label": final_label, "score": blended_score}
+
+
+def _merge_results(openai_parsed: dict, grok_parsed: dict) -> dict:
+    merged = dict(openai_parsed)
+    osent = openai_parsed.get("sentiment", {}) or {}
+    gsent = grok_parsed.get("sentiment", {}) or {}
+    if osent and gsent:
+        merged["sentiment"] = _blend_scores(
+            osent.get("label", "neutral"), osent.get("score", 0.5),
+            gsent.get("label", "neutral"), gsent.get("score", 0.5),
+        )
+    elif gsent:
+        merged["sentiment"] = dict(gsent)
+    merged["social_sources"] = grok_parsed.get("social_sources", []) or []
+    merged["volume_bias"] = grok_parsed.get("volume_bias", "unknown")
+    return merged
+
+
+async def _call_xai_chat_completions(payload: dict) -> dict:
+    api_key = get_xai_api_key()
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY not configured")
+    import httpx
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(base_url=XAI_BASE_URL, timeout=30) as client:
+        resp = await client.post("/chat/completions", json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    return data
+
+
+async def analyze_with_grok(quote_text: str, ticker: str) -> tuple[dict | None, str, list | None]:
+    api_key = get_xai_api_key()
+    if not api_key:
+        _debug_log("XAI_API_KEY not set; skipping Grok analysis")
+        return None, AI_STATUS_GK_NO_KEY, None
+
+    payload = {
+        "model": XAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a financial sentiment analyst trained on social media discourse. "
+                    "Given a stock ticker and recent market context, return a JSON object with: "
+                    "(1) 'social_sources': a list of 2-3 representative themes found across "
+                    "social platforms (X/Twitter, Reddit, StockTwits); "
+                    "(2) 'sentiment': label (bullish|bearish|neutral) and confidence score 0-1; "
+                    "(3) 'volume_bias': 'high|moderate|low' — relative social discussion volume. "
+                    "Return ONLY valid JSON, no additional commentary."
+                ),
+            },
+            {"role": "user", "content": f"Ticker: {ticker}\nContext:\n{quote_text[:400]}"},
+        ],
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }
+
+    _debug_log(f"Invoking xAI model {XAI_MODEL} for ticker {ticker}")
+    try:
+        raw = await _call_xai_chat_completions(payload)
+        content = raw["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        _debug_log(f"Grok returned parsed payload: {parsed}")
+        return parsed, AI_STATUS_OK, parsed.get("social_sources")
+    except Exception as gk_err:
+        _debug_log(f"Grok analysis failed: {type(gk_err).__name__}: {gk_err}")
+        return None, AI_STATUS_GK_ERROR, None
+
+
 async def analyze_with_openai(quote_text: str, ticker: str) -> tuple[dict | None, str]:
     """Call the OpenAI model on a stock quote and return a structured payload.
 
@@ -311,7 +422,9 @@ async def analyze_with_openai(quote_text: str, ticker: str) -> tuple[dict | None
 
 
 def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None,
-                             status: str = AI_STATUS_OK) -> str:
+                             status: str = AI_STATUS_OK,
+                             social_notes: str | None = None,
+                             grok_status: str = AI_STATUS_DISABLED) -> str:
     """Render the textual analysis.
 
     The raw stock quote is ALWAYS shown. When AI analysis is unavailable a
@@ -344,9 +457,20 @@ def render_analysis_markdown(ticker: str, quote: str, parsed: dict | None,
     label = sentiment.get("label", "n/a")
     score = sentiment.get("score", "n/a")
     score_display = f"{score:.2f}" if isinstance(score, (int, float)) else score
+
+    social_themes = parsed.get("social_sources") or []
+    social_section = ""
+    if social_themes:
+        themes_md = " · ".join(social_themes)
+        social_section = f"\n\n**Social themes:** {themes_md}"
+
+    if social_notes:
+        social_section = f"\n\n> ℹ️ {social_notes}{social_section}"
+
     return (
         f"{base}\n\n"
-        f"#### AI Analysis ({label.upper()}, confidence {score_display})\n\n"
+        f"#### AI Analysis ({label.upper()}, confidence {score_display})"
+        f"{social_section}\n\n"
         f"{parsed.get('analysis', '')}"
     )
 
@@ -470,7 +594,7 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
             f"{error_details}"
         )
 
-async def chat_with_mcp(message: str, history: list) -> str:
+async def chat_with_mcp(message: str, history: list, use_grok: bool = False) -> str:
     """
     Native asynchronous Gradio execution hook. Prevents thread-blocking
     and handles state transformations cleanly under concurrent access.
@@ -478,6 +602,7 @@ async def chat_with_mcp(message: str, history: list) -> str:
     _debug_log(f"=== chat_with_mcp START ===")
     _debug_log(f"Received message: '{message}'")
     _debug_log(f"History length: {len(history)}")
+    _debug_log(f"use_grok: {use_grok}")
     
     ticker = extract_ticker(message)
     _debug_log(f"Extracted ticker: {ticker}")
@@ -490,14 +615,29 @@ async def chat_with_mcp(message: str, history: list) -> str:
     mcp_response = await call_alpha_vantage_mcp(ticker)
     _debug_log(f"MCP response received (length: {len(mcp_response)})")
 
-    # If the MCP call itself failed, surface that as text without chart output.
     if mcp_response.startswith("### "):
         _debug_log("MCP returned an error header; skipping AI analysis")
         return mcp_response, "<!-- MCP error: no chart -->"
 
-    parsed, ai_status = await analyze_with_openai(mcp_response, ticker)
-    markdown = render_analysis_markdown(ticker, mcp_response, parsed, ai_status)
-    chart_html = render_chartjs_html(parsed, ticker, ai_status)
+    openai_parsed, openai_status = await analyze_with_openai(mcp_response, ticker)
+
+    social_notes = None
+
+    if use_grok and openai_status != AI_STATUS_NO_KEY:
+        grok_parsed, grok_status, social_sources = await analyze_with_grok(mcp_response, ticker)
+        if grok_status == AI_STATUS_OK and grok_parsed and openai_parsed:
+            merged_parsed = _merge_results(openai_parsed, grok_parsed)
+        else:
+            merged_parsed = openai_parsed
+            if grok_status == AI_STATUS_GK_NO_KEY:
+                social_notes = "Social sentiment unavailable — XAI_API_KEY not configured. Using core analysis only."
+            elif grok_status == AI_STATUS_GK_ERROR:
+                social_notes = "Social sentiment unavailable — xAI request failed. Using core analysis only."
+    else:
+        merged_parsed = openai_parsed
+
+    markdown = render_analysis_markdown(ticker, mcp_response, merged_parsed, openai_status, social_notes)
+    chart_html = render_chartjs_html(merged_parsed, ticker, openai_status)
     _debug_log("=== chat_with_mcp END ===")
     return markdown, chart_html
 
@@ -513,10 +653,12 @@ async def chat_with_mcp(message: str, history: list) -> str:
 charts_output = gr.HTML(label="Charts", render=False)
 
 with gr.Blocks() as demo:
+    use_grok_cb = gr.Checkbox(label="Use Grok social sentiment", value=False)
     gr.ChatInterface(
         fn=chat_with_mcp,
         title="Alpha Vantage Assistant",
-        description="Async MCP stock quotes + OpenAI analysis with Chart.js visuals.",
+        description="Async MCP stock quotes + OpenAI analysis with optional Grok social sentiment.",
+        additional_inputs=[use_grok_cb],
         additional_outputs=[charts_output],
         examples=["What's happening with TSLA?", "Check current quote value for NVDA", "AAPL"],
     )

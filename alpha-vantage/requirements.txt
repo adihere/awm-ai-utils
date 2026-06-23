@@ -2,5 +2,6 @@ gradio
 mcp
 openai>=1.40.0
 python-dotenv
+httpx>=0.25.0,<1.0
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
