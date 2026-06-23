@@ -501,13 +501,26 @@ async def chat_with_mcp(message: str, history: list) -> str:
     _debug_log("=== chat_with_mcp END ===")
     return markdown, chart_html
 
-demo = gr.ChatInterface(
-    fn=chat_with_mcp,
-    title="Alpha Vantage Assistant",
-    description="Async MCP stock quotes + OpenAI analysis with Chart.js visuals.",
-    additional_outputs=[gr.HTML(label="Charts")],
-    examples=["What's happening with TSLA?", "Check current quote value for NVDA", "AAPL"]
-)
+# The Chart.js panel is an additional output of the ChatInterface. Such a
+# component must be created with `render=False`, handed to `additional_outputs`,
+# and then explicitly `.render()`-ed inside the same `gr.Blocks` scope. Declaring
+# it inline as `additional_outputs=[gr.HTML(...)]` leaves the component orphaned
+# (never attached to the rendered layout): the submit event still references it
+# as an output, so when the response arrives the frontend tries to update a
+# component that has no DOM node and throws
+# "Cannot read properties of null (reading 'props')", flagging the whole reply
+# as an Error and never showing the chart. See gradio demo/chatinterface_artifacts.
+charts_output = gr.HTML(label="Charts", render=False)
+
+with gr.Blocks() as demo:
+    gr.ChatInterface(
+        fn=chat_with_mcp,
+        title="Alpha Vantage Assistant",
+        description="Async MCP stock quotes + OpenAI analysis with Chart.js visuals.",
+        additional_outputs=[charts_output],
+        examples=["What's happening with TSLA?", "Check current quote value for NVDA", "AAPL"],
+    )
+    charts_output.render()
 
 if __name__ == "__main__":
     _debug_log("Application starting...")

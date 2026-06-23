@@ -1,0 +1,61 @@
+- generic [ref=e21]:
+  - main [ref=e22]:
+    - generic [ref=e23]:
+      - generic [ref=e24]:
+        - heading "Alpha Vantage Assistant" [level=1] [ref=e29]
+        - paragraph [ref=e34]: Async MCP stock quotes + OpenAI analysis with Chart.js visuals.
+        - generic [ref=e36]:
+          - generic:
+            - generic:
+              - img
+            - text: Chatbot
+          - generic [ref=e74]:
+            - button [ref=e75] [cursor=pointer]:
+              - img [ref=e77]
+            - button "Clear" [ref=e79] [cursor=pointer]:
+              - img [ref=e81]
+            - button "Copy conversation" [ref=e87] [cursor=pointer]:
+              - img [ref=e89]
+          - log "chatbot conversation" [ref=e37]:
+            - generic [ref=e92]:
+              - 'generic "user''s message: What''s happening with TSLA?" [ref=e97]':
+                - paragraph [ref=e100]: What's happening with TSLA?
+              - button "Copy message" [ref=e103] [cursor=pointer]:
+                - img [ref=e105]
+              - 'generic "bot''s message: ### Analysis for **TSLA** via Workspace Protocol Hub: TSLA raw quote text #### AI Analysis (BULLISH, confidence 0.85) Tesla shows a bullish trend today, opened at $394.85, high $414.75." [ref=e112]':
+                - generic [ref=e114]:
+                  - heading "Analysis for TSLA via Workspace Protocol Hub:" [level=3] [ref=e115]:
+                    - text: Analysis for
+                    - strong [ref=e116]: TSLA
+                    - text: "via Workspace Protocol Hub:"
+                  - paragraph [ref=e117]: TSLA raw quote text
+                  - heading "AI Analysis (BULLISH, confidence 0.85)" [level=4] [ref=e118]
+                  - paragraph [ref=e119]: Tesla shows a bullish trend today, opened at $394.85, high $414.75.
+              - generic [ref=e121]:
+                - button "Copy message" [ref=e122] [cursor=pointer]:
+                  - img [ref=e124]
+                - button "Retry" [ref=e127] [cursor=pointer]:
+                  - img [ref=e129]
+                - button "Undo" [ref=e134] [cursor=pointer]:
+                  - img "undo" [ref=e136]
+        - generic [ref=e55]:
+          - generic [ref=e56]: Textbox
+          - generic [ref=e57]:
+            - textbox "Textbox" [ref=e58]:
+              - /placeholder: ""
+            - button [ref=e139] [cursor=pointer]:
+              - img [ref=e140]
+      - iframe [ref=e144]
+  - contentinfo "Gradio footer navigation" [ref=e65]:
+    - button "Use via API logo" [ref=e66] [cursor=pointer]:
+      - text: Use via API
+      - img "logo" [ref=e67]
+    - generic [ref=e68]: ·
+    - link "Built with Gradio logo" [ref=e69] [cursor=pointer]:
+      - /url: https://gradio.app
+      - text: Built with Gradio
+      - img "logo" [ref=e70]
+    - generic [ref=e71]: ·
+    - button "Settings Settings" [ref=e72] [cursor=pointer]:
+      - text: Settings
+      - img "Settings" [ref=e73]

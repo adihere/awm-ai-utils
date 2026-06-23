@@ -1,0 +1,64 @@
+- generic [ref=e21]:
+  - main [ref=e22]:
+    - generic [ref=e24]:
+      - heading "Alpha Vantage Assistant" [level=1] [ref=e29]
+      - paragraph [ref=e34]: Async MCP stock quotes + OpenAI analysis with Chart.js visuals.
+      - generic [ref=e35]:
+        - generic [ref=e72]:
+          - button "Clear" [ref=e74] [cursor=pointer]:
+            - img [ref=e76]
+          - generic [ref=e80]: Error
+        - generic [ref=e36]:
+          - generic:
+            - generic:
+              - img
+            - text: Chatbot
+          - generic [ref=e81]:
+            - button [ref=e82] [cursor=pointer]:
+              - img [ref=e84]
+            - button "Clear" [ref=e86] [cursor=pointer]:
+              - img [ref=e88]
+            - button "Copy conversation" [ref=e94] [cursor=pointer]:
+              - img [ref=e96]
+          - log "chatbot conversation" [ref=e37]:
+            - generic [ref=e99]:
+              - 'generic "user''s message: What''s happening with TSLA?" [ref=e104]':
+                - paragraph [ref=e107]: What's happening with TSLA?
+              - button "Copy message" [ref=e110] [cursor=pointer]:
+                - img [ref=e112]
+              - 'generic "bot''s message: ### Analysis for **TSLA** via Workspace Protocol Hub: TSLA raw quote text #### AI Analysis (BULLISH, confidence 0.85) Tesla shows a bullish trend today, opened at $394.85, high $414.75." [ref=e119]':
+                - generic [ref=e121]:
+                  - heading "Analysis for TSLA via Workspace Protocol Hub:" [level=3] [ref=e122]:
+                    - text: Analysis for
+                    - strong [ref=e123]: TSLA
+                    - text: "via Workspace Protocol Hub:"
+                  - paragraph [ref=e124]: TSLA raw quote text
+                  - heading "AI Analysis (BULLISH, confidence 0.85)" [level=4] [ref=e125]
+                  - paragraph [ref=e126]: Tesla shows a bullish trend today, opened at $394.85, high $414.75.
+              - generic [ref=e128]:
+                - button "Copy message" [ref=e129] [cursor=pointer]:
+                  - img [ref=e131]
+                - button "Retry" [ref=e134] [cursor=pointer]:
+                  - img [ref=e136]
+                - button "Undo" [ref=e141] [cursor=pointer]:
+                  - img "undo" [ref=e143]
+      - generic [ref=e55]:
+        - generic [ref=e56]: Textbox
+        - generic [ref=e57]:
+          - textbox "Textbox" [disabled] [ref=e58]:
+            - /placeholder: ""
+          - button [ref=e146] [cursor=pointer]:
+            - img [ref=e147]
+  - contentinfo "Gradio footer navigation" [ref=e63]:
+    - button "Use via API logo" [ref=e64] [cursor=pointer]:
+      - text: Use via API
+      - img "logo" [ref=e65]
+    - generic [ref=e66]: ·
+    - link "Built with Gradio logo" [ref=e67] [cursor=pointer]:
+      - /url: https://gradio.app
+      - text: Built with Gradio
+      - img "logo" [ref=e68]
+    - generic [ref=e69]: ·
+    - button "Settings Settings" [ref=e70] [cursor=pointer]:
+      - text: Settings
+      - img "Settings" [ref=e71]
