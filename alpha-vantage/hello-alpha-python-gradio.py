@@ -10,17 +10,41 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from typing import List
 
-# Load environment variables from .env file if it exists
-try:
-    from dotenv import load_dotenv
-    # Load .env from the alpha-vantage directory (same location as this script)
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    load_dotenv(env_path)
-except ImportError:
-    pass  # dotenv not installed, use environment variables as-is
+def _env_value(key: str, default: str | None = None,
+               env_path: str | None = None) -> str | None:
+    """Resolve a configuration value with environment-over-.env precedence.
+
+    Resolution order:
+    1. The process environment variable (``os.environ``) — highest priority.
+       A non-empty value is returned immediately and the ``.env`` file is
+       never consulted.
+    2. A value loaded from a ``.env`` file via ``python-dotenv`` with
+       ``override=False`` (its default), which guarantees an existing
+       environment variable is never clobbered. The ``.env`` file therefore
+       only supplies a value when the variable is absent from the environment.
+    3. ``default`` if neither source provides the key.
+
+    When ``python-dotenv`` is not installed only the environment variable and
+    ``default`` are consulted. ``env_path`` defaults to the directory holding
+    this script.
+    """
+    existing = os.environ.get(key)
+    if existing:
+        return existing
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return default
+
+    if env_path is None:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(env_path, override=False)
+    return os.environ.get(key, default)
+
 
 # Global debug flag - set to True to enable verbose debug logging
-DEBUG = os.environ.get("ALPHA_VANTAGE_DEBUG", "false").lower() in ("true", "1", "yes")
+DEBUG = _env_value("ALPHA_VANTAGE_DEBUG", "false").lower() in ("true", "1", "yes")
 
 def _debug_log(*args, **kwargs):
     """Conditional debug logging. Only prints when DEBUG flag is True."""
@@ -31,13 +55,13 @@ _cached_mcp_url = None
 
 # OpenAI model id, defaulting to the smallest/cheapest current OpenAI model.
 # (OpenAI has no model literally named "nano"; gpt-4o-mini is the equivalent.)
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = _env_value("OPENAI_MODEL", "gpt-4o-mini")
 
 # xAI Grok model id, defaulting to grok-4.3.
-XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.3")
+XAI_MODEL = _env_value("XAI_MODEL", "grok-4.3")
 
 # xAI API base URL.
-XAI_BASE_URL = os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1")
+XAI_BASE_URL = _env_value("XAI_BASE_URL", "https://api.x.ai/v1")
 
 # Status codes describing why AI analysis did (or did not) produce output.
 # Returning a status alongside the payload lets the renderers show a precise,
@@ -233,40 +257,20 @@ def get_api_key(key_name: str = "OPENAI_API_KEY",
                 env_path: str | None = None) -> str | None:
     """Return the requested API key, prioritizing the environment variable.
 
-    Resolution order:
-    1. The existing process environment variable (``os.environ``) — highest
-       priority. If it is set to a non-empty value it is returned immediately
-       and the ``.env`` file is never consulted.
-    2. A value loaded from a ``.env`` file via python-dotenv, used only when
-       the variable is absent from the environment.
-
-    python-dotenv is invoked with ``override=False`` (its default), so a value
-    already present in the environment is never clobbered by the ``.env`` file,
-    preserving the required precedence. When python-dotenv is not installed,
-    only the environment variable is consulted.
+    Delegates to :func:`_env_value`: the process environment variable is
+    consulted first, and only when it is absent (or empty) is a value loaded
+    from a ``.env`` file via ``python-dotenv`` with ``override=False`` so an
+    existing variable is never clobbered. When ``python-dotenv`` is not
+    installed, only the environment variable is consulted.
 
     Returns the key string when found, or None if it cannot be resolved from
     either source.
     """
-    existing = os.environ.get(key_name)
-    if existing:
-        _debug_log(f"API key '{key_name}' resolved from environment variable")
-        return existing
-
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        _debug_log("python-dotenv unavailable; cannot read .env file")
-        return None
-
-    if env_path is None:
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-
-    # override=False (the default) guarantees an existing environment variable
-    # is never overwritten by a value from the .env file.
-    load_dotenv(env_path, override=False)
-    value = os.environ.get(key_name)
-    _debug_log(f"API key '{key_name}' resolved from .env: {bool(value)}")
+    value = _env_value(key_name, None, env_path)
+    if value:
+        _debug_log(f"API key '{key_name}' resolved from environment or .env")
+    else:
+        _debug_log(f"API key '{key_name}' not found in environment or .env")
     return value
 
 

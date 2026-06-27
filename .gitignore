@@ -79,6 +79,7 @@ mcp-server/
 mcp-client/
 
 # IDEs and editors
+.vscode/*
 .vscode/
 .idea/
 *.swp
