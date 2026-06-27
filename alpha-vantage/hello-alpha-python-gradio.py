@@ -543,19 +543,15 @@ async def call_alpha_vantage_mcp(ticker: str) -> str:
                 await session.initialize()
                 _debug_log("Session initialized successfully")
 
-                # The Alpha Vantage MCP server exposes a meta-tool interface
-                # (TOOL_LIST / TOOL_GET / TOOL_CALL) rather than individual
-                # endpoints. To fetch a quote we invoke TOOL_CALL which wraps
-                # the underlying GLOBAL_QUOTE Alpha Vantage function. The inner
-                # arguments MUST be a JSON-encoded string (per the TOOL_CALL
-                # schema) and GLOBAL_QUOTE expects a "symbol" parameter.
-                tool_call_args = {
-                    "tool_name": "GLOBAL_QUOTE",
-                    "arguments": json.dumps({"symbol": ticker}),
-                }
-                _debug_log(f"Calling tool 'TOOL_CALL' with arguments: {tool_call_args}")
+                # The Alpha Vantage MCP server exposes each function as its own
+                # tool (e.g. GLOBAL_QUOTE), NOT via a TOOL_CALL meta-wrapper.
+                # Calling a non-existent tool causes the server to drop the
+                # stream (surfacing as "Session terminated"), so we invoke
+                # GLOBAL_QUOTE directly with its native "symbol" argument.
+                tool_call_args = {"symbol": ticker}
+                _debug_log(f"Calling tool 'GLOBAL_QUOTE' with arguments: {tool_call_args}")
                 response = await session.call_tool(
-                    name="TOOL_CALL",
+                    name="GLOBAL_QUOTE",
                     arguments=tool_call_args,
                 )
                 _debug_log(f"Tool response received, content length: {len(response.content) if response.content else 0}")
@@ -667,7 +663,11 @@ with gr.Blocks() as demo:
         description="Async MCP stock quotes + OpenAI analysis with optional Grok social sentiment.",
         additional_inputs=[use_grok_cb],
         additional_outputs=[charts_output],
-        examples=["What's happening with TSLA?", "Check current quote value for NVDA", "AAPL"],
+        examples=[
+            ["What's happening with TSLA?", False],
+            ["Check current quote value for NVDA", False],
+            ["AAPL", False],
+        ],
     )
     charts_output.render()
 
