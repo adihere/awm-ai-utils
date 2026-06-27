@@ -63,6 +63,10 @@ XAI_MODEL = _env_value("XAI_MODEL", "grok-4.3")
 # xAI API base URL.
 XAI_BASE_URL = _env_value("XAI_BASE_URL", "https://api.x.ai/v1")
 
+# When ALPHA_VANTAGE_DEMO=true, expose preset Alpha Vantage REST queries
+# (apikey=demo, symbol=IBM) in the UI as selectable test cases.
+DEMO_MODE = _env_value("ALPHA_VANTAGE_DEMO", "false").lower() in ("true", "1", "yes")
+
 # Status codes describing why AI analysis did (or did not) produce output.
 # Returning a status alongside the payload lets the renderers show a precise,
 # actionable warning (missing key vs. API failure) without disrupting the
@@ -644,6 +648,78 @@ async def chat_with_mcp(message: str, history: list, use_grok: bool = False) -> 
     _debug_log("=== chat_with_mcp END ===")
     return markdown, chart_html
 
+# ---------------------------------------------------------------------------
+# Demo mode: preset Alpha Vantage REST queries (apikey=demo, symbol=IBM)
+# ---------------------------------------------------------------------------
+ALPHA_VANTAGE_QUERY_URL = "https://www.alphavantage.co/query"
+
+_DEMO_PRESETS = {
+    "1. Default (recent 100 intraday bars)": {
+        "symbol": "IBM", "interval": "5min", "outputsize": "compact", "month": "",
+    },
+    "2. Extended intraday (last 30 days, full)": {
+        "symbol": "IBM", "interval": "5min", "outputsize": "full", "month": "",
+    },
+    "3. Historical month (2009-01, full)": {
+        "symbol": "IBM", "interval": "5min", "outputsize": "full", "month": "2009-01",
+    },
+}
+
+_DEMO_INTERVAL_CHOICES = ["1min", "5min", "15min", "30min", "60min"]
+
+
+def _apply_demo_preset(name: str):
+    """Populate the demo input fields from the selected preset."""
+    preset = _DEMO_PRESETS.get(name)
+    if not preset:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+    return preset["symbol"], preset["interval"], preset["outputsize"], preset["month"]
+
+
+async def fetch_intraday_demo(symbol: str, interval: str, outputsize: str, month: str):
+    """Fetch TIME_SERIES_INTRADAY from the Alpha Vantage REST API (demo key).
+
+    Mirrors the three required demo configurations. ``outputsize`` is only sent
+    when set to ``"full"`` (compact is the server default and is omitted to
+    match example 1). ``month`` must be ``YYYY-MM`` and no earlier than
+    ``2000-01``. Returns the parsed JSON response for display.
+    """
+    import httpx
+
+    symbol = (symbol or "IBM").strip() or "IBM"
+    interval = (interval or "5min").strip() or "5min"
+    outputsize = (outputsize or "").strip()
+    month = (month or "").strip()
+
+    if month:
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            return {"error": "month must be YYYY-MM (e.g. 2009-01)"}
+        year, mon = month.split("-")
+        if int(year) < 2000 or not (1 <= int(mon) <= 12):
+            return {"error": "month must be between 2000-01 and the current month"}
+
+    params = {
+        "function": "TIME_SERIES_INTRADAY",
+        "symbol": symbol,
+        "interval": interval,
+        "apikey": "demo",
+    }
+    if outputsize == "full":
+        params["outputsize"] = "full"
+    if month:
+        params["month"] = month
+
+    safe_params = {k: v for k, v in params.items() if k != "apikey"}
+    _debug_log(f"Demo query params: {safe_params}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(ALPHA_VANTAGE_QUERY_URL, params=params)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as demo_err:
+        _debug_log(f"Demo query failed: {type(demo_err).__name__}: {demo_err}")
+        return {"error": f"{type(demo_err).__name__}: {demo_err}"}
+
 # The Chart.js panel is an additional output of the ChatInterface. Such a
 # component must be created with `render=False`, handed to `additional_outputs`,
 # and then explicitly `.render()`-ed inside the same `gr.Blocks` scope. Declaring
@@ -670,6 +746,46 @@ with gr.Blocks() as demo:
         ],
     )
     charts_output.render()
+
+    if DEMO_MODE:
+        with gr.Accordion("Alpha Vantage Demo Queries (apikey=demo)", open=True):
+            gr.Markdown(
+                "Preset **TIME_SERIES_INTRADAY** queries using the public `demo` "
+                "API key (symbol `IBM`). Select a preset to populate the fields, "
+                "then run the query to view the response. The `month` field "
+                "accepts any `YYYY-MM` value from `2000-01` onward."
+            )
+            demo_preset = gr.Radio(
+                choices=list(_DEMO_PRESETS.keys()),
+                value="1. Default (recent 100 intraday bars)",
+                label="Select example query",
+            )
+            with gr.Row():
+                demo_symbol = gr.Textbox(label="symbol", value="IBM")
+                demo_interval = gr.Dropdown(
+                    choices=_DEMO_INTERVAL_CHOICES, value="5min", label="interval"
+                )
+                demo_outputsize = gr.Dropdown(
+                    choices=["compact", "full"], value="compact", label="outputsize",
+                    info="compact = omit param (100 bars, default); full = last 30 days",
+                )
+                demo_month = gr.Textbox(
+                    label="month (YYYY-MM)", value="",
+                    info="Optional; any month from 2000-01 onward",
+                )
+            demo_btn = gr.Button("Run demo query", variant="primary")
+            demo_out = gr.JSON(label="API Response")
+
+            demo_preset.change(
+                fn=_apply_demo_preset,
+                inputs=demo_preset,
+                outputs=[demo_symbol, demo_interval, demo_outputsize, demo_month],
+            )
+            demo_btn.click(
+                fn=fetch_intraday_demo,
+                inputs=[demo_symbol, demo_interval, demo_outputsize, demo_month],
+                outputs=demo_out,
+            )
 
 if __name__ == "__main__":
     _debug_log("Application starting...")
